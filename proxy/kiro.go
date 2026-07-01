@@ -239,6 +239,9 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	// OnFirstToken fires once, right before the first content/tool-use event
+	// is dispatched, so callers can measure time-to-first-token (TTFT).
+	OnFirstToken func()
 }
 
 // ==================== API Call ====================
@@ -425,6 +428,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	var firstTokenFired bool
+
+	fireFirstToken := func() {
+		if firstTokenFired {
+			return
+		}
+		firstTokenFired = true
+		if callback.OnFirstToken != nil {
+			callback.OnFirstToken()
+		}
+	}
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -475,6 +489,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if content, ok := event["content"].(string); ok && content != "" {
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
+					fireFirstToken()
 					callback.OnText(normalized, false)
 				}
 			}
@@ -482,10 +497,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
+					fireFirstToken()
 					callback.OnText(normalized, true)
 				}
 			}
 		case "toolUseEvent":
+			fireFirstToken()
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {

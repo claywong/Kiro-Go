@@ -481,6 +481,7 @@
   "logs.model": "Model",
   "logs.account": "Account",
   "logs.tokens": "Tokens",
+  "logs.ttft": "TTFT",
   "logs.duration": "Duration",
   "logs.detail": "Detail",
   "errors.typeQuota": "Quota",
