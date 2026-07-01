@@ -276,6 +276,144 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Sticky session routing
+// ---------------------------------------------------------------------------
+
+func newStickyTestPool(accounts ...config.Account) *AccountPool {
+	p := newTestPool(accounts...)
+	p.stickySessions = make(map[string]stickyEntry)
+	p.stickyTTL = time.Hour
+	return p
+}
+
+func TestGetForSessionReusesLastSuccessfulAccount(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "b")
+
+	for i := 0; i < 5; i++ {
+		acc := p.GetForSession("conv-1", "model", map[string]bool{})
+		if acc == nil || acc.ID != "b" {
+			t.Fatalf("expected sticky account b, got %#v", acc)
+		}
+	}
+}
+
+func TestGetForSessionFallsBackWhenNoStickyEntry(t *testing.T) {
+	p := newStickyTestPool(config.Account{ID: "a"})
+	acc := p.GetForSession("conv-unseen", "model", map[string]bool{})
+	if acc == nil || acc.ID != "a" {
+		t.Fatalf("expected fallback to round robin, got %#v", acc)
+	}
+}
+
+func TestGetForSessionFallsBackWhenStickyAccountExcluded(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "a")
+
+	acc := p.GetForSession("conv-1", "model", map[string]bool{"a": true})
+	if acc == nil || acc.ID != "b" {
+		t.Fatalf("expected fallback to account b when sticky account excluded, got %#v", acc)
+	}
+}
+
+func TestGetForSessionFallsBackWhenStickyEntryExpired(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.mu.Lock()
+	p.stickySessions["conv-1"] = stickyEntry{AccountID: "a", ExpiresAt: time.Now().Add(-time.Minute)}
+	p.mu.Unlock()
+
+	acc := p.GetForSession("conv-1", "model", map[string]bool{})
+	if acc == nil {
+		t.Fatal("expected fallback account, got nil")
+	}
+	if acc.ID == "a" {
+		t.Fatal("expected expired sticky entry to be ignored, but it was still used")
+	}
+}
+
+func TestGetForSessionFallsBackWhenStickyAccountInCooldown(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "a")
+	p.mu.Lock()
+	p.cooldowns["a"] = time.Now().Add(time.Minute)
+	p.mu.Unlock()
+
+	acc := p.GetForSession("conv-1", "model", map[string]bool{})
+	if acc == nil || acc.ID != "b" {
+		t.Fatalf("expected fallback to account b when sticky account is in cooldown, got %#v", acc)
+	}
+}
+
+func TestGetForSessionIgnoresEmptySessionKey(t *testing.T) {
+	p := newStickyTestPool(config.Account{ID: "a"})
+	acc := p.GetForSession("", "model", map[string]bool{})
+	if acc == nil || acc.ID != "a" {
+		t.Fatalf("expected round robin when sessionKey is empty, got %#v", acc)
+	}
+}
+
+func TestGetForSessionDisabledSwitchFallsBackToRoundRobin(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateStickySessionRouting(false); err != nil {
+		t.Fatalf("UpdateStickySessionRouting: %v", err)
+	}
+
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "b")
+
+	// RecordStickySuccess itself is a no-op while disabled, so nothing should
+	// have been recorded; GetForSession should degrade to plain round robin.
+	p.mu.RLock()
+	_, tracked := p.stickySessions["conv-1"]
+	p.mu.RUnlock()
+	if tracked {
+		t.Fatal("expected RecordStickySuccess to be a no-op when routing is disabled")
+	}
+
+	acc := p.GetForSession("conv-1", "model", map[string]bool{})
+	if acc == nil {
+		t.Fatal("expected an account from round robin fallback")
+	}
+}
+
+func TestPruneExpiredStickyLockedRemovesOnlyExpiredEntries(t *testing.T) {
+	p := newStickyTestPool()
+	now := time.Now()
+	p.mu.Lock()
+	p.stickySessions["expired"] = stickyEntry{AccountID: "a", ExpiresAt: now.Add(-time.Minute)}
+	p.stickySessions["active"] = stickyEntry{AccountID: "b", ExpiresAt: now.Add(time.Minute)}
+	p.pruneExpiredStickyLocked(now)
+	_, expiredStillPresent := p.stickySessions["expired"]
+	_, activeStillPresent := p.stickySessions["active"]
+	p.mu.Unlock()
+
+	if expiredStillPresent {
+		t.Fatal("expected expired sticky entry to be pruned")
+	}
+	if !activeStillPresent {
+		t.Fatal("expected active sticky entry to remain")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Reload over-usage filtering
 // ---------------------------------------------------------------------------
 
