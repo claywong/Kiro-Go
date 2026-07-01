@@ -21,16 +21,17 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Ttft      int64   `json:"ttft"`      // Time to first token in ms (0 if unavailable)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -859,6 +860,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := thinkingOpts.Format
 
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
@@ -888,16 +890,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		var account *config.Account
-		if attempt == 0 {
-			account = h.pool.GetForSession(sessionKey, model, excluded)
-		} else {
-			account = h.pool.GetNextForModelExcluding(model, excluded)
-		}
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -909,6 +906,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var ttftMs int64
 		var toolUses []KiroToolUse
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
@@ -1219,15 +1217,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnFirstToken: func() {
+				ttftMs = time.Since(reqStart).Milliseconds()
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			if !messageStarted {
-				continue
+			if isTTFTTimeoutError(err) {
+				h.recordTTFTTimeoutRetry("claude", model, account, attempt, err, trace)
+				if !messageStarted {
+					continue
+				}
+			} else {
+				h.handleAccountFailure(account, err)
+				if !messageStarted {
+					continue
+				}
 			}
 			h.recordFailureWithDetails("claude", model, account.ID, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
@@ -1263,7 +1271,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1385,10 +1393,21 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 	}
 
 	h.appendRequestLog(entry)
+	logger.Warnf("[Request] status=error endpoint=%s model=%s account=%s error_type=%s error=%q",
+		endpoint, model, accountID, errType, errMsg)
+}
+
+func (h *Handler) recordTTFTTimeoutRetry(endpoint, model string, account *config.Account, attempt int, err error, trace *requestTrace) {
+	timeout := ttftTimeoutFromError(err)
+	accountID := traceAccountID(account)
+	trace.mark("ttft_timeout_retry", fmt.Sprintf("endpoint=%s model=%s account=%s attempt=%d/%d threshold=%dms error=%s",
+		endpoint, model, accountID, attempt+1, maxAccountRetryAttempts, timeout.Milliseconds(), traceErr(err)))
+	logger.Warnf("[RequestRetry] reason=ttft_timeout endpoint=%s model=%s account=%s attempt=%d/%d threshold=%dms error=%q",
+		endpoint, model, accountID, attempt+1, maxAccountRetryAttempts, timeout.Milliseconds(), err.Error())
 }
 
 // recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, ttftMs, durationMs int64, trace *requestTrace) {
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
 		Endpoint:  endpoint,
@@ -1397,10 +1416,17 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int
 		Status:    "success",
 		Tokens:    tokens,
 		Credits:   credits,
+		Ttft:      ttftMs,
 		Duration:  durationMs,
 	}
 
 	h.appendRequestLog(entry)
+	logger.Infof("[Request] status=success endpoint=%s model=%s account=%s tokens=%d credits=%g ttft=%dms duration=%dms",
+		endpoint, model, accountID, tokens, credits, ttftMs, durationMs)
+	if ttftMs > slowTTFTDebugThresholdMs {
+		logger.Warnf("[RequestDebug] reason=slow_ttft threshold=%dms endpoint=%s model=%s account=%s ttft=%dms duration=%dms trace=%q",
+			slowTTFTDebugThresholdMs, endpoint, model, accountID, ttftMs, durationMs, trace.summary())
+	}
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -1418,6 +1444,8 @@ func (h *Handler) appendRequestLog(entry RequestLog) {
 // classifyError categorizes an error message into a type for display.
 func classifyError(msg string) string {
 	switch {
+	case strings.Contains(strings.ToLower(msg), "ttft timeout"):
+		return "ttft_timeout"
 	case isQuotaErrorMessage(msg):
 		return "quota"
 	case isOverageErrorMessage(msg):
@@ -1453,18 +1481,14 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		var account *config.Account
-		if attempt == 0 {
-			account = h.pool.GetForSession(sessionKey, model, excluded)
-		} else {
-			account = h.pool.GetNextForModelExcluding(model, excluded)
-		}
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1478,6 +1502,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var ttftMs int64
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1500,12 +1525,19 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnFirstToken: func() {
+				ttftMs = time.Since(reqStart).Milliseconds()
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			if isTTFTTimeoutError(err) {
+				h.recordTTFTTimeoutRetry("claude", model, account, attempt, err, trace)
+				continue
+			}
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -1532,7 +1564,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1647,18 +1679,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		var account *config.Account
-		if attempt == 0 {
-			account = h.pool.GetForSession(sessionKey, model, excluded)
-		} else {
-			account = h.pool.GetNextForModelExcluding(model, excluded)
-		}
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -1670,6 +1698,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var ttftMs int64
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -1944,15 +1973,25 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnFirstToken: func() {
+				ttftMs = time.Since(reqStart).Milliseconds()
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			if !responseStarted {
-				continue
+			if isTTFTTimeoutError(err) {
+				h.recordTTFTTimeoutRetry("openai", model, account, attempt, err, trace)
+				if !responseStarted {
+					continue
+				}
+			} else {
+				h.handleAccountFailure(account, err)
+				if !responseStarted {
+					continue
+				}
 			}
 			h.recordFailureWithDetails("openai", model, account.ID, err)
 			return
@@ -1986,7 +2025,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2031,18 +2070,14 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		var account *config.Account
-		if attempt == 0 {
-			account = h.pool.GetForSession(sessionKey, model, excluded)
-		} else {
-			account = h.pool.GetNextForModelExcluding(model, excluded)
-		}
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -2055,6 +2090,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var ttftMs int64
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2070,12 +2106,19 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnFirstToken: func() {
+				ttftMs = time.Since(reqStart).Milliseconds()
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			if isTTFTTimeoutError(err) {
+				h.recordTTFTTimeoutRetry("openai", model, account, attempt, err, trace)
+				continue
+			}
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -2098,7 +2141,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)

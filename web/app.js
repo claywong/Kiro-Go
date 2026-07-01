@@ -747,6 +747,7 @@
       '<th>' + escapeHtml(t('logs.model')) + '</th>' +
       '<th>' + escapeHtml(t('logs.account')) + '</th>' +
       '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.ttft')) + '</th>' +
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
@@ -769,6 +770,7 @@
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
         '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
+        '<td>' + (l.ttft ? (l.ttft + 'ms') : '-') + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
         '</tr>';

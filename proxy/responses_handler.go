@@ -132,18 +132,14 @@ func (h *Handler) handleResponsesNonStream(
 	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		var account *config.Account
-		if attempt == 0 {
-			account = h.pool.GetForSession(sessionKey, model, excluded)
-		} else {
-			account = h.pool.GetNextForModelExcluding(model, excluded)
-		}
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -155,6 +151,7 @@ func (h *Handler) handleResponsesNonStream(
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var ttftMs int64
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -170,12 +167,19 @@ func (h *Handler) handleResponsesNonStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnFirstToken: func() {
+				ttftMs = time.Since(reqStart).Milliseconds()
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			if isTTFTTimeoutError(err) {
+				h.recordTTFTTimeoutRetry("responses", model, account, attempt, err, trace)
+				continue
+			}
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -196,7 +200,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
@@ -324,18 +328,14 @@ func (h *Handler) handleResponsesStream(
 	var lastErr error
 	responseStarted := false
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		var account *config.Account
-		if attempt == 0 {
-			account = h.pool.GetForSession(sessionKey, model, excluded)
-		} else {
-			account = h.pool.GetNextForModelExcluding(model, excluded)
-		}
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -355,6 +355,7 @@ func (h *Handler) handleResponsesStream(
 			outputTokens    int
 			credits         float64
 			realInputTokens int
+			ttftMs          int64
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -481,13 +482,20 @@ func (h *Handler) handleResponsesStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnFirstToken: func() {
+				ttftMs = time.Since(reqStart).Milliseconds()
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
+				if isTTFTTimeoutError(err) {
+					h.recordTTFTTimeoutRetry("responses", model, account, attempt, err, trace)
+					continue
+				}
 				h.handleAccountFailure(account, err)
 				continue
 			}
@@ -550,7 +558,7 @@ func (h *Handler) handleResponsesStream(
 		h.pool.RecordSuccess(account.ID)
 		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt

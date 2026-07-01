@@ -481,6 +481,7 @@
   "logs.model": "模型",
   "logs.account": "账号",
   "logs.tokens": "Tokens",
+  "logs.ttft": "首字延迟",
   "logs.duration": "耗时",
   "logs.detail": "详情",
   "errors.typeQuota": "配额",

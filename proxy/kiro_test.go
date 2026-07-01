@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"kiro-go/config"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -104,6 +105,63 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 
 	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
+	}
+}
+
+func TestCallKiroAPIWithTraceTTFTTimeoutBeforeFirstToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	configureSingleKiroTestEndpoint(t, server)
+
+	err := CallKiroAPIWithTraceAndTTFTTimeout(
+		testKiroAccount(),
+		testKiroPayload("claude-sonnet-5"),
+		&KiroStreamCallback{},
+		newRequestTrace(time.Now()),
+		20*time.Millisecond,
+	)
+	if !isTTFTTimeoutError(err) {
+		t.Fatalf("expected TTFT timeout error, got %v", err)
+	}
+}
+
+func TestCallKiroAPIWithTraceTTFTTimeoutStopsAfterFirstToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "hello",
+		}))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}))
+	defer server.Close()
+	configureSingleKiroTestEndpoint(t, server)
+
+	var gotText string
+	err := CallKiroAPIWithTraceAndTTFTTimeout(
+		testKiroAccount(),
+		testKiroPayload("claude-sonnet-5"),
+		&KiroStreamCallback{
+			OnText: func(text string, isThinking bool) {
+				gotText += text
+			},
+		},
+		newRequestTrace(time.Now()),
+		20*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("expected first token to stop TTFT timeout, got %v", err)
+	}
+	if gotText != "hello" {
+		t.Fatalf("expected streamed text, got %q", gotText)
 	}
 }
 
@@ -242,6 +300,50 @@ func assertProxyURL(t *testing.T, got *url.URL, want string) {
 	if got.String() != want {
 		t.Fatalf("expected proxy URL %q, got %q", want, got.String())
 	}
+}
+
+func configureSingleKiroTestEndpoint(t *testing.T, server *httptest.Server) {
+	t.Helper()
+
+	if err := config.Init(t.TempDir() + "/config.json"); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	oldEndpoints := kiroEndpoints
+	kiroEndpoints = []kiroEndpoint{{
+		URL:    server.URL,
+		Origin: "AI_EDITOR",
+		Name:   "test",
+	}}
+	t.Cleanup(func() { kiroEndpoints = oldEndpoints })
+
+	oldClient := kiroHttpStore.Load()
+	kiroHttpStore.Store(server.Client())
+	t.Cleanup(func() { kiroHttpStore.Store(oldClient) })
+}
+
+func testKiroAccount() *config.Account {
+	return &config.Account{
+		ID:          "test-account",
+		AccessToken: "test-token",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}
+}
+
+func testKiroPayload(model string) *KiroPayload {
+	payload := &KiroPayload{}
+	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
+		Content: "hello",
+		ModelID: model,
+		Origin:  "AI_EDITOR",
+	}
+	return payload
 }
 
 func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]interface{}) []byte {
