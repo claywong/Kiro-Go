@@ -872,6 +872,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
+	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
@@ -897,7 +898,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
@@ -1275,6 +1276,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
@@ -1484,12 +1486,13 @@ func (h *Handler) getRequestLogs() []RequestLog {
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
+	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
@@ -1566,6 +1569,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
@@ -1680,12 +1684,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
+	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
@@ -2026,6 +2031,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
@@ -2069,12 +2075,13 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 // handleOpenAINonStream OpenAI 非流式响应
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
+	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
+		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
@@ -2140,6 +2147,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
@@ -3190,16 +3198,19 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
 		"uptime":          time.Now().Unix() - h.startTime,
+		"stickySessions":  h.pool.StickySessionStats(),
 	})
 }
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":                  config.GetApiKey(),
+		"requireApiKey":           config.IsApiKeyRequired(),
+		"port":                    config.GetPort(),
+		"host":                    config.GetHost(),
+		"allowOverUsage":          config.GetAllowOverUsage(),
+		"stickySessionRouting":    config.GetStickySessionRouting(),
+		"stickySessionTTLSeconds": int(config.GetStickySessionTTL().Seconds()),
 	})
 }
 
@@ -3248,10 +3259,12 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		ApiKey                  *string `json:"apiKey,omitempty"`
+		RequireApiKey           *bool   `json:"requireApiKey,omitempty"`
+		Password                string  `json:"password,omitempty"`
+		AllowOverUsage          *bool   `json:"allowOverUsage,omitempty"`
+		StickySessionRouting    *bool   `json:"stickySessionRouting,omitempty"`
+		StickySessionTTLSeconds *int    `json:"stickySessionTTLSeconds,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3273,6 +3286,23 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
+		h.pool.Reload()
+	}
+
+	// 更新会话粘性路由设置
+	if req.StickySessionRouting != nil {
+		if err := config.UpdateStickySessionRouting(*req.StickySessionRouting); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if req.StickySessionTTLSeconds != nil {
+		if err := config.UpdateStickySessionTTL(*req.StickySessionTTLSeconds); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
 		h.pool.Reload()
 	}
 

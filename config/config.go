@@ -182,6 +182,16 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// StickySessionRouting controls whether requests belonging to the same
+	// conversation prefer the account that last successfully served it, to
+	// maximize prompt-cache hits. Defaults to true (nil/unset -> true).
+	StickySessionRouting *bool `json:"stickySessionRouting,omitempty"`
+
+	// StickySessionTTLSeconds controls how long a conversation stays pinned to
+	// its last successful account after last use, in seconds.
+	// 0 or unset uses the built-in default (see GetStickySessionTTL).
+	StickySessionTTLSeconds int `json:"stickySessionTTLSeconds,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -842,6 +852,50 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// defaultStickySessionTTL is 1 hour: it must cover the longest-lived prompt
+// cache breakpoint TTL (see proxy/cache_tracker.go normalizePromptCacheTTL,
+// which caps at time.Hour for 1h cache_control blocks), otherwise the sticky
+// route could expire and reroute to a different account before the underlying
+// simulated cache entry itself expires, defeating the purpose.
+const defaultStickySessionTTL = time.Hour
+
+// GetStickySessionRouting returns whether sticky session routing is enabled.
+// Defaults to true so cache hit rate improves out of the box.
+func GetStickySessionRouting() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.StickySessionRouting == nil {
+		return true
+	}
+	return *cfg.StickySessionRouting
+}
+
+// UpdateStickySessionRouting sets the sticky session routing switch and persists it.
+func UpdateStickySessionRouting(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.StickySessionRouting = &enabled
+	return Save()
+}
+
+// GetStickySessionTTL returns the configured sticky session TTL, defaulting to 1 hour.
+func GetStickySessionTTL() time.Duration {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.StickySessionTTLSeconds <= 0 {
+		return defaultStickySessionTTL
+	}
+	return time.Duration(cfg.StickySessionTTLSeconds) * time.Second
+}
+
+// UpdateStickySessionTTL sets the sticky session TTL (seconds) and persists it.
+func UpdateStickySessionTTL(seconds int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.StickySessionTTLSeconds = seconds
 	return Save()
 }
 

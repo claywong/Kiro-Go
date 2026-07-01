@@ -12,6 +12,12 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// stickyEntry 记录某个会话上次成功使用的账号，用于提升 prompt cache 命中率。
+type stickyEntry struct {
+	AccountID string
+	ExpiresAt time.Time
+}
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
@@ -21,6 +27,9 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+
+	stickySessions map[string]stickyEntry // conversationID → 上次成功服务它的账号
+	stickyTTL      time.Duration           // 会话粘性存活时间
 }
 
 var (
@@ -32,9 +41,11 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:      make(map[string]time.Time),
+			errorCounts:    make(map[string]int),
+			modelLists:     make(map[string]map[string]bool),
+			stickySessions: make(map[string]stickyEntry),
+			stickyTTL:      config.GetStickySessionTTL(),
 		}
 		pool.Reload()
 	})
@@ -63,6 +74,8 @@ func (p *AccountPool) Reload() {
 	}
 	p.accounts = weighted
 	p.totalAccounts = len(enabled)
+	p.stickyTTL = config.GetStickySessionTTL()
+	p.pruneExpiredStickyLocked(time.Now())
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -253,6 +266,99 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		}
 	}
 	return best
+}
+
+// GetForSession 会话粘性路由：优先复用 sessionKey（对话 ID）上次成功服务过它的账号，
+// 以提升该账号上模拟 prompt cache 的命中率；粘性账号不存在/已过期/不可用时，
+// 无缝回退到 GetNextForModelExcluding 的加权轮询逻辑。
+func (p *AccountPool) GetForSession(sessionKey, model string, excluded map[string]bool) *config.Account {
+	if sessionKey == "" || !config.GetStickySessionRouting() {
+		return p.GetNextForModelExcluding(model, excluded)
+	}
+
+	p.mu.RLock()
+	var candidate *config.Account
+	if entry, ok := p.stickySessions[sessionKey]; ok && time.Now().Before(entry.ExpiresAt) {
+		allowOverUsage := config.GetAllowOverUsage()
+		now := time.Now()
+		for i := range p.accounts {
+			acc := &p.accounts[i]
+			if acc.ID != entry.AccountID {
+				continue
+			}
+			if excluded != nil && excluded[acc.ID] {
+				break
+			}
+			if !p.accountHasModel(acc.ID, model) {
+				break
+			}
+			if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+				break
+			}
+			if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+				break
+			}
+			if isQuotaBlocked(*acc, allowOverUsage) {
+				break
+			}
+			found := *acc
+			candidate = &found
+			break
+		}
+	}
+	p.mu.RUnlock()
+
+	if candidate != nil {
+		return candidate
+	}
+	return p.GetNextForModelExcluding(model, excluded)
+}
+
+// RecordStickySuccess 在请求成功后写入/刷新会话粘性映射。
+// 只在成功路径调用（而非选中账号时），这样一次失败不会把会话永久锁定在坏账号上：
+// 失败时不写入，excluded 会在本次请求内排除掉它，下次重试自然换到别的账号。
+func (p *AccountPool) RecordStickySuccess(sessionKey, accountID string) {
+	if sessionKey == "" || accountID == "" || !config.GetStickySessionRouting() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	p.pruneExpiredStickyLocked(now)
+	p.stickySessions[sessionKey] = stickyEntry{
+		AccountID: accountID,
+		ExpiresAt: now.Add(p.stickyTTL),
+	}
+}
+
+// pruneExpiredStickyLocked 清理过期的会话粘性条目。调用方需持有 p.mu 写锁。
+func (p *AccountPool) pruneExpiredStickyLocked(now time.Time) {
+	for key, entry := range p.stickySessions {
+		if !entry.ExpiresAt.After(now) {
+			delete(p.stickySessions, key)
+		}
+	}
+}
+
+// StickySessionStats 返回会话粘性表的聚合统计，供 admin 状态接口展示。
+// 不暴露明文 sessionKey -> accountID 映射，只给计数信息。
+func (p *AccountPool) StickySessionStats() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	active := 0
+	perAccount := make(map[string]int)
+	for _, entry := range p.stickySessions {
+		if now.Before(entry.ExpiresAt) {
+			active++
+			perAccount[entry.AccountID]++
+		}
+	}
+	return map[string]interface{}{
+		"activeSessions":    active,
+		"totalTracked":      len(p.stickySessions),
+		"sessionsByAccount": perAccount,
+	}
 }
 
 // GetByID 根据 ID 获取账号
