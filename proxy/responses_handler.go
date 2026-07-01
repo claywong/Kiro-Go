@@ -131,13 +131,14 @@ func (h *Handler) handleResponsesNonStream(
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -170,10 +171,14 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
+			if isTTFTTimeoutError(err) {
+				h.recordTTFTTimeoutRetry("responses", model, account, attempt, err, trace)
+				continue
+			}
 			h.handleAccountFailure(account, err)
 			continue
 		}
@@ -193,7 +198,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
@@ -320,13 +325,14 @@ func (h *Handler) handleResponsesStream(
 	var lastErr error
 	responseStarted := false
 	reqStart := time.Now()
+	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
@@ -478,11 +484,15 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPIWithTraceAndTTFTTimeout(account, payload, callback, trace, ttftRetryTimeout)
 		if err != nil {
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
+				if isTTFTTimeoutError(err) {
+					h.recordTTFTTimeoutRetry("responses", model, account, attempt, err, trace)
+					continue
+				}
 				h.handleAccountFailure(account, err)
 				continue
 			}
@@ -544,7 +554,7 @@ func (h *Handler) handleResponsesStream(
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt

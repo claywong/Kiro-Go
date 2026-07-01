@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -293,6 +294,22 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIWithTrace(account, payload, callback, nil)
+}
+
+// CallKiroAPIWithTrace calls the Kiro streaming API and records timing details
+// used to diagnose slow time-to-first-token requests.
+func CallKiroAPIWithTrace(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, trace *requestTrace) error {
+	return callKiroAPIWithTrace(account, payload, callback, trace, 0)
+}
+
+// CallKiroAPIWithTraceAndTTFTTimeout calls the Kiro streaming API and cancels
+// the upstream attempt if no first token arrives before ttftTimeout.
+func CallKiroAPIWithTraceAndTTFTTimeout(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, trace *requestTrace, ttftTimeout time.Duration) error {
+	return callKiroAPIWithTrace(account, payload, callback, trace, ttftTimeout)
+}
+
+func callKiroAPIWithTrace(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback, trace *requestTrace, ttftTimeout time.Duration) error {
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -326,30 +343,41 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	}
 
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
+		profileStarted := time.Now()
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
+			trace.addDuration("resolve_profile_arn", profileStarted, fmt.Sprintf("account=%s status=ok profile_region=%s", traceAccountID(account), regionFromProfileArn(profileArn)))
 		} else if isProfileArnResolutionSoftError(err) {
+			trace.addDuration("resolve_profile_arn", profileStarted, fmt.Sprintf("account=%s status=soft_error error=%s", traceAccountID(account), traceErr(err)))
 			logger.Debugf("[ProfileArn] Skipped profile ARN resolution for %s: %v", accountEmailForLog(account), err)
 		} else {
+			trace.addDuration("resolve_profile_arn", profileStarted, fmt.Sprintf("account=%s status=error error=%s", traceAccountID(account), traceErr(err)))
 			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmailForLog(account), err)
 		}
+	} else if payload != nil {
+		trace.mark("resolve_profile_arn", fmt.Sprintf("account=%s status=cached profile_region=%s", traceAccountID(account), regionFromProfileArn(payload.ProfileArn)))
 	}
 
 	// Build endpoint list ordered by configuration.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
 	var lastErr error
-	for _, ep := range endpoints {
+	for endpointAttempt, ep := range endpoints {
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
 		// Target the profile's data-plane region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURLForProfile(ep.URL, account, payload.ProfileArn)
+		trace.mark("endpoint_start", fmt.Sprintf("attempt=%d endpoint=%s url=%s", endpointAttempt+1, ep.Name, epURL))
+		ctx, cleanupTTFTTimeout, attemptCallback := prepareTTFTTimeoutAttempt(callback, trace, ep.Name, ttftTimeout)
 
+		buildStarted := time.Now()
 		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
+			cleanupTTFTTimeout()
 			lastErr = err
+			trace.addDuration("build_upstream_request", buildStarted, fmt.Sprintf("endpoint=%s status=error error=%s", ep.Name, traceErr(err)))
 			continue
 		}
 
@@ -369,16 +397,29 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		req.Header.Set("x-amzn-codewhisperer-optout", "true")
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 		req.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
+		trace.addDuration("build_upstream_request", buildStarted, fmt.Sprintf("endpoint=%s bytes=%d", ep.Name, len(reqBody)))
 
+		doStarted := time.Now()
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
+			if timeoutErr := ttftTimeoutCause(ctx, err); timeoutErr != nil {
+				cleanupTTFTTimeout()
+				lastErr = timeoutErr
+				trace.addDuration("upstream_http_do", doStarted, fmt.Sprintf("endpoint=%s status=ttft_timeout error=%s", ep.Name, traceErr(timeoutErr)))
+				return timeoutErr
+			}
+			cleanupTTFTTimeout()
 			lastErr = err
+			trace.addDuration("upstream_http_do", doStarted, fmt.Sprintf("endpoint=%s status=error error=%s", ep.Name, traceErr(err)))
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
 			continue
 		}
+		trace.addDuration("upstream_http_do", doStarted, fmt.Sprintf("endpoint=%s status=%d", ep.Name, resp.StatusCode))
 
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
+			cleanupTTFTTimeout()
+			trace.mark("upstream_response", fmt.Sprintf("endpoint=%s status=429 action=fallback", ep.Name))
 			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
 			continue
@@ -387,7 +428,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			cleanupTTFTTimeout()
 			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			trace.mark("upstream_response", fmt.Sprintf("endpoint=%s status=%d action=fallback error=%s", ep.Name, resp.StatusCode, traceErr(lastErr)))
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
@@ -396,8 +439,15 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			continue
 		}
 
-		err = parseEventStream(resp.Body, callback)
+		parseStarted := time.Now()
+		err = parseEventStreamWithContextAndTrace(ctx, resp.Body, attemptCallback, trace, ep.Name, parseStarted)
+		trace.addDuration("event_stream_total", parseStarted, fmt.Sprintf("endpoint=%s status=done error=%s", ep.Name, traceErr(err)))
 		resp.Body.Close()
+		if timeoutErr := ttftTimeoutCause(ctx, err); timeoutErr != nil {
+			cleanupTTFTTimeout()
+			return timeoutErr
+		}
+		cleanupTTFTTimeout()
 		return err
 	}
 
@@ -405,6 +455,73 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		return lastErr
 	}
 	return fmt.Errorf("all endpoints failed")
+}
+
+func prepareTTFTTimeoutAttempt(callback *KiroStreamCallback, trace *requestTrace, endpointName string, timeout time.Duration) (context.Context, func(), *KiroStreamCallback) {
+	if timeout <= 0 {
+		return context.Background(), func() {}, callback
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	timeoutErr := &ttftTimeoutError{Timeout: timeout, Endpoint: endpointName}
+	var settled atomic.Bool
+
+	timer := time.AfterFunc(timeout, func() {
+		if !settled.CompareAndSwap(false, true) {
+			return
+		}
+		trace.mark("ttft_timeout", fmt.Sprintf("endpoint=%s threshold=%dms", endpointName, timeout.Milliseconds()))
+		cancel(timeoutErr)
+	})
+
+	wrapped := &KiroStreamCallback{}
+	if callback != nil {
+		*wrapped = *callback
+	}
+	originalOnFirstToken := wrapped.OnFirstToken
+	wrapped.OnFirstToken = func() {
+		if settled.CompareAndSwap(false, true) {
+			timer.Stop()
+		}
+		if originalOnFirstToken != nil {
+			originalOnFirstToken()
+		}
+	}
+
+	cleanup := func() {
+		if settled.CompareAndSwap(false, true) {
+			timer.Stop()
+		}
+		cancel(nil)
+	}
+
+	return ctx, cleanup, wrapped
+}
+
+func ttftTimeoutCause(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isTTFTTimeoutError(err) {
+		return err
+	}
+	cause := context.Cause(ctx)
+	if isTTFTTimeoutError(cause) {
+		return cause
+	}
+	return nil
+}
+
+func contextError(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 func accountEmailForLog(account *config.Account) string {
@@ -418,8 +535,19 @@ func accountEmailForLog(account *config.Account) string {
 
 // parseEventStream decodes an AWS binary Event Stream response body.
 func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+	return parseEventStreamWithTrace(body, callback, nil, "", time.Time{})
+}
+
+func parseEventStreamWithTrace(body io.Reader, callback *KiroStreamCallback, trace *requestTrace, endpointName string, parseStarted time.Time) error {
+	return parseEventStreamWithContextAndTrace(context.Background(), body, callback, trace, endpointName, parseStarted)
+}
+
+func parseEventStreamWithContextAndTrace(ctx context.Context, body io.Reader, callback *KiroStreamCallback, trace *requestTrace, endpointName string, parseStarted time.Time) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
+	}
+	if parseStarted.IsZero() {
+		parseStarted = time.Now()
 	}
 
 	// Read directly without bufio to avoid buffering latency in streaming responses.
@@ -429,18 +557,24 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var lastAssistantContent string
 	var lastReasoningContent string
 	var firstTokenFired bool
+	var firstEventSeen bool
 
-	fireFirstToken := func() {
+	fireFirstToken := func(eventType string) {
 		if firstTokenFired {
 			return
 		}
 		firstTokenFired = true
+		trace.addDuration("wait_first_token_event", parseStarted, fmt.Sprintf("endpoint=%s event=%s", endpointName, eventType))
 		if callback.OnFirstToken != nil {
 			callback.OnFirstToken()
 		}
 	}
 
 	for {
+		if err := contextError(ctx); err != nil {
+			return err
+		}
+
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
@@ -448,6 +582,9 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			break
 		}
 		if err != nil {
+			if ctxErr := contextError(ctx); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		}
 
@@ -463,6 +600,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			if ctxErr := contextError(ctx); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+
+		if err := contextError(ctx); err != nil {
 			return err
 		}
 
@@ -480,8 +624,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		if err := json.Unmarshal(payloadBytes, &event); err != nil {
 			continue
 		}
+		if !firstEventSeen {
+			firstEventSeen = true
+			trace.addDuration("wait_first_event", parseStarted, fmt.Sprintf("endpoint=%s event=%s", endpointName, eventType))
+		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		if err := contextError(ctx); err != nil {
+			return err
+		}
 
 		// Dispatch by event type.
 		switch eventType {
@@ -489,7 +640,7 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if content, ok := event["content"].(string); ok && content != "" {
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
-					fireFirstToken()
+					fireFirstToken(eventType)
 					callback.OnText(normalized, false)
 				}
 			}
@@ -497,12 +648,12 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			if text, ok := event["text"].(string); ok && text != "" {
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
-					fireFirstToken()
+					fireFirstToken(eventType)
 					callback.OnText(normalized, true)
 				}
 			}
 		case "toolUseEvent":
-			fireFirstToken()
+			fireFirstToken(eventType)
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
