@@ -17,7 +17,15 @@ import (
 	"github.com/google/uuid"
 )
 
-const tokenRefreshSkewSeconds int64 = 120
+// tokenRefreshSkewSeconds is how far ahead of expiry a token is proactively
+// refreshed — by the background loop, the per-request lazy refresh
+// (ensureValidToken), and the admin manual refresh. It is deliberately LARGER
+// than the pool's skip skew (pool.tokenRefreshSkewSeconds) so accounts in the
+// [expiry-600s, expiry-120s] window are still selectable and get refreshed
+// inline on the request path, instead of being skipped before they can be
+// renewed. Short-lived (≈1h) external-IdP tokens need this wider window so the
+// 30-minute background tick and per-request lazy refresh renew them reliably.
+const tokenRefreshSkewSeconds int64 = 600
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
