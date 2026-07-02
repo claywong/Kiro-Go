@@ -205,6 +205,21 @@ func (p *AccountPool) pickInPoolLocked(sensitive bool, model string, excluded ma
 	return best
 }
 
+// SensitiveAccountIDs 返回当前可路由账号里 MinIntervalMs>0 的账号 ID 列表。
+// 用于 quota 兜底：某个敏感账号 429 后，一次性把整个敏感池加进请求 excluded，
+// 让下一轮 pickTwoPool 直接落到正常池。
+func (p *AccountPool) SensitiveAccountIDs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ids := make([]string, 0)
+	for i := range p.accounts {
+		if p.accounts[i].MinIntervalMs > 0 {
+			ids = append(ids, p.accounts[i].ID)
+		}
+	}
+	return ids
+}
+
 // GetByID 根据 ID 获取账号
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.Lock()
