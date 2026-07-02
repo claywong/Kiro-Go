@@ -129,13 +129,12 @@ func (h *Handler) handleResponsesNonStream(
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
-	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
+		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
@@ -198,7 +197,6 @@ func (h *Handler) handleResponsesNonStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
@@ -324,14 +322,13 @@ func (h *Handler) handleResponsesStream(
 	})
 
 	excluded := make(map[string]bool)
-	sessionKey := payload.ConversationState.ConversationID
 	var lastErr error
 	responseStarted := false
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
+		account := h.pickAccountForModelWithTrace(model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
@@ -556,7 +553,6 @@ func (h *Handler) handleResponsesStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 

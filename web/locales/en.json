@@ -197,6 +197,8 @@
   "detail.generateFailed": "Generate failed",
   "detail.weight": "Request Weight",
   "detail.weightHint": "0-1 = normal, 2+ = higher priority",
+  "detail.minInterval": "Min Interval (ms)",
+  "detail.minIntervalHint": "Minimum gap between two requests to this account. 0 = no throttle. Set > 0 for sensitive accounts (e.g. 20000 for 20s). Sensitive accounts are preferred when available so their per-window quota isn't wasted.",
   "detail.overage": "Overages (Upstream)",
   "detail.overageHint": "Toggling calls AWS Q setUserPreference and flips Overages in your Kiro account immediately",
   "detail.overageStatus": "Current status",

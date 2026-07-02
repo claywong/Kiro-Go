@@ -8,12 +8,22 @@ import (
 	"time"
 )
 
-func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
-	p := &AccountPool{}
-	normal := config.Account{ID: "normal"}
-	overLimit := config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10}
+func newTestPool(accounts ...config.Account) *AccountPool {
+	p := &AccountPool{
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
+		lastUsedAt:  make(map[string]time.Time),
+	}
+	p.accounts = accounts
+	return p
+}
 
-	p.accounts = []config.Account{normal, overLimit}
+func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "normal"},
+		config.Account{ID: "over", UsageCurrent: 10, UsageLimit: 10},
+	)
 
 	for i := 0; i < 5; i++ {
 		acc := p.GetNext()
@@ -27,15 +37,12 @@ func TestOverLimitAccountsAreSkippedByDefault(t *testing.T) {
 }
 
 func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) {
-	p := &AccountPool{}
-	overLimit := config.Account{
+	p := newTestPool(config.Account{
 		ID:            "over",
 		UsageCurrent:  10,
 		UsageLimit:    10,
 		OverageStatus: "ENABLED",
-	}
-
-	p.accounts = []config.Account{overLimit}
+	})
 
 	acc := p.GetNext()
 	if acc == nil {
@@ -47,15 +54,12 @@ func TestOverLimitAccountsCanBeSelectedWhenUpstreamOverageEnabled(t *testing.T) 
 }
 
 func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T) {
-	p := &AccountPool{}
-	overLimit := config.Account{
+	p := newTestPool(config.Account{
 		ID:            "over",
 		UsageCurrent:  10,
 		UsageLimit:    10,
 		OverageStatus: "DISABLED",
-	}
-
-	p.accounts = []config.Account{overLimit}
+	})
 
 	if acc := p.GetNext(); acc != nil {
 		t.Fatalf("expected nil when upstream OverageStatus=DISABLED, got %q", acc.ID)
@@ -63,14 +67,12 @@ func TestOverLimitAccountsRemainSkippedWhenUpstreamOverageDisabled(t *testing.T)
 }
 
 func TestGetNextKeepsFiveMinuteTokenAvailable(t *testing.T) {
-	p := &AccountPool{}
 	account := config.Account{
 		ID:          "acct-1",
 		AccessToken: "access-token",
 		ExpiresAt:   time.Now().Unix() + 300,
 	}
-
-	p.accounts = []config.Account{account}
+	p := newTestPool(account)
 
 	got := p.GetNext()
 	if got == nil {
@@ -104,11 +106,9 @@ func TestIsAuthFailureRecognizes401And403(t *testing.T) {
 }
 
 func TestIsAuthFailureIgnoresFalsePositives(t *testing.T) {
-	// hasStatusToken only excludes digit boundaries; e.g. "4011" contains "401"
-	// but the trailing '1' is a digit so it does NOT match.
 	negatives := []string{
-		"status code 4011 found", // digit immediately after 401 → not a standalone token
-		"error 14013 exceeded",   // digit before and after 401
+		"status code 4011 found",
+		"error 14013 exceeded",
 		"some random error",
 		"status 200 OK",
 	}
@@ -134,7 +134,7 @@ func TestIsSuspensionErrorDetectsKnownMessages(t *testing.T) {
 		"account temporarily_suspended",
 		"account temporarily suspended",
 		"no available kiro profile",
-		"No Available Kiro Profile", // case-insensitive
+		"No Available Kiro Profile",
 	}
 	for _, msg := range positives {
 		if !IsSuspensionError(errors.New(msg)) {
@@ -165,16 +165,6 @@ func TestIsSuspensionErrorNilError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // GetNextForModelExcluding
 // ---------------------------------------------------------------------------
-
-func newTestPool(accounts ...config.Account) *AccountPool {
-	p := &AccountPool{
-		cooldowns:   make(map[string]time.Time),
-		errorCounts: make(map[string]int),
-		modelLists:  make(map[string]map[string]bool),
-	}
-	p.accounts = accounts
-	return p
-}
 
 func TestGetNextForModelExcludingSkipsExcludedAccounts(t *testing.T) {
 	p := newTestPool(
@@ -214,7 +204,6 @@ func TestGetNextForModelExcludingReturnsNilOnEmptyPool(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDisableAccountSetsCooldown(t *testing.T) {
-	// Initialize a temporary config so SetAccountBanStatus can persist safely.
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := config.Init(cfgFile); err != nil {
 		t.Fatalf("config.Init: %v", err)
@@ -223,14 +212,13 @@ func TestDisableAccountSetsCooldown(t *testing.T) {
 	p := newTestPool()
 	p.DisableAccount("test-id", "test reason")
 
-	p.mu.RLock()
+	p.mu.Lock()
 	cooldown, ok := p.cooldowns["test-id"]
-	p.mu.RUnlock()
+	p.mu.Unlock()
 
 	if !ok {
 		t.Fatal("expected cooldown to be set after DisableAccount")
 	}
-	// Safety-net cooldown must be at least 23 hours from now.
 	minExpected := time.Now().Add(23 * time.Hour)
 	if cooldown.Before(minExpected) {
 		t.Fatalf("expected cooldown >= 23h in future, got %v", cooldown)
@@ -238,17 +226,10 @@ func TestDisableAccountSetsCooldown(t *testing.T) {
 }
 
 func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
-	p := &AccountPool{
-		accounts: []config.Account{
-			{ID: "a", Enabled: true},
-			{ID: "b", Enabled: true},
-		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
-	}
-
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
 	acc := p.GetNextExcluding(map[string]bool{"a": true})
 	if acc == nil || acc.ID != "b" {
 		t.Fatalf("expected account b, got %#v", acc)
@@ -256,16 +237,10 @@ func TestGetNextExcludingSkipsExcludedAccount(t *testing.T) {
 }
 
 func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
-	p := &AccountPool{
-		accounts: []config.Account{
-			{ID: "a", Enabled: true},
-			{ID: "b", Enabled: true},
-		},
-		cooldowns:    make(map[string]time.Time),
-		errorCounts:  make(map[string]int),
-		modelLists:   make(map[string]map[string]bool),
-		currentIndex: ^uint64(0),
-	}
+	p := newTestPool(
+		config.Account{ID: "a", Enabled: true},
+		config.Account{ID: "b", Enabled: true},
+	)
 	p.SetModelList("a", []string{"claude-sonnet-4.5"})
 	p.SetModelList("b", []string{"claude-sonnet-4.5"})
 
@@ -276,140 +251,121 @@ func TestGetNextForModelExcludingSkipsExcludedAccount(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Sticky session routing
+// Two-pool LRU scheduling (sensitive-first, LRU within pool)
 // ---------------------------------------------------------------------------
 
-func newStickyTestPool(accounts ...config.Account) *AccountPool {
-	p := newTestPool(accounts...)
-	p.stickySessions = make(map[string]stickyEntry)
-	p.stickyTTL = time.Hour
-	return p
-}
-
-func TestGetForSessionReusesLastSuccessfulAccount(t *testing.T) {
-	p := newStickyTestPool(
-		config.Account{ID: "a"},
-		config.Account{ID: "b"},
+// Sensitive accounts (MinIntervalMs > 0) should be picked before normal ones
+// when they are within their window budget.
+func TestSensitivePoolPreferredOverNormalWhenAvailable(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "normal"},
+		config.Account{ID: "sensitive", MinIntervalMs: 20000},
 	)
-	p.RecordStickySuccess("conv-1", "b")
-
-	for i := 0; i < 5; i++ {
-		acc := p.GetForSession("conv-1", "model", map[string]bool{})
-		if acc == nil || acc.ID != "b" {
-			t.Fatalf("expected sticky account b, got %#v", acc)
-		}
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "sensitive" {
+		t.Fatalf("expected sensitive account to be preferred, got %#v", acc)
 	}
 }
 
-func TestGetForSessionFallsBackWhenNoStickyEntry(t *testing.T) {
-	p := newStickyTestPool(config.Account{ID: "a"})
-	acc := p.GetForSession("conv-unseen", "model", map[string]bool{})
-	if acc == nil || acc.ID != "a" {
-		t.Fatalf("expected fallback to round robin, got %#v", acc)
+// After a sensitive account is picked, another request within MinInterval must
+// fall back to the normal pool rather than reusing the sensitive one.
+func TestSensitiveThrottleFallsBackToNormalPool(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "normal"},
+		config.Account{ID: "sensitive", MinIntervalMs: 20000},
+	)
+
+	first := p.GetNext()
+	if first == nil || first.ID != "sensitive" {
+		t.Fatalf("first pick expected sensitive, got %#v", first)
+	}
+	second := p.GetNext()
+	if second == nil || second.ID != "normal" {
+		t.Fatalf("second pick within MinInterval expected fallback to normal, got %#v", second)
 	}
 }
 
-func TestGetForSessionFallsBackWhenStickyAccountExcluded(t *testing.T) {
-	p := newStickyTestPool(
-		config.Account{ID: "a"},
-		config.Account{ID: "b"},
+// Two sensitive accounts should be picked round-robin-ish via LRU: whichever
+// was used longest ago wins.
+func TestSensitivePoolLRUAlternatesBetweenAccounts(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "s1", MinIntervalMs: 20000},
+		config.Account{ID: "s2", MinIntervalMs: 20000},
 	)
-	p.RecordStickySuccess("conv-1", "a")
 
-	acc := p.GetForSession("conv-1", "model", map[string]bool{"a": true})
-	if acc == nil || acc.ID != "b" {
-		t.Fatalf("expected fallback to account b when sticky account excluded, got %#v", acc)
+	first := p.GetNext()
+	second := p.GetNext()
+	if first == nil || second == nil {
+		t.Fatalf("expected two picks, got %v / %v", first, second)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("LRU should alternate; got %s twice", first.ID)
 	}
 }
 
-func TestGetForSessionFallsBackWhenStickyEntryExpired(t *testing.T) {
-	p := newStickyTestPool(
+// When all sensitive accounts are throttled and no normal exists, return nil so
+// the handler can respond with 503 (方案 A).
+func TestReturnsNilWhenAllSensitiveThrottledAndNoNormal(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "s1", MinIntervalMs: 20000},
+	)
+	first := p.GetNext()
+	if first == nil || first.ID != "s1" {
+		t.Fatalf("expected s1 on first pick, got %#v", first)
+	}
+	second := p.GetNext()
+	if second != nil {
+		t.Fatalf("expected nil when all sensitive throttled and no normal pool, got %#v", second)
+	}
+}
+
+// A sensitive account should re-enter the pool once its window elapses.
+func TestSensitiveAccountAvailableAgainAfterInterval(t *testing.T) {
+	p := newTestPool(
+		config.Account{ID: "s1", MinIntervalMs: 50}, // 50ms so the test is fast
+	)
+	if acc := p.GetNext(); acc == nil || acc.ID != "s1" {
+		t.Fatalf("first pick expected s1, got %#v", acc)
+	}
+	if acc := p.GetNext(); acc != nil {
+		t.Fatalf("expected throttle immediately after use, got %#v", acc)
+	}
+	time.Sleep(70 * time.Millisecond)
+	if acc := p.GetNext(); acc == nil || acc.ID != "s1" {
+		t.Fatalf("expected s1 to be available again after MinInterval, got %#v", acc)
+	}
+}
+
+// LRU among normal accounts: after picking A, the next pick should be B, not A.
+func TestNormalPoolLRUAlternates(t *testing.T) {
+	p := newTestPool(
 		config.Account{ID: "a"},
 		config.Account{ID: "b"},
 	)
+	first := p.GetNext()
+	second := p.GetNext()
+	if first == nil || second == nil || first.ID == second.ID {
+		t.Fatalf("expected LRU alternation, got %v / %v", first, second)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RecordError cooldown durations
+// ---------------------------------------------------------------------------
+
+func TestRecordErrorQuotaUsesShortCooldown(t *testing.T) {
+	p := newTestPool(config.Account{ID: "x"})
+	p.RecordError("x", true)
+
 	p.mu.Lock()
-	p.stickySessions["conv-1"] = stickyEntry{AccountID: "a", ExpiresAt: time.Now().Add(-time.Minute)}
+	cd, ok := p.cooldowns["x"]
 	p.mu.Unlock()
-
-	acc := p.GetForSession("conv-1", "model", map[string]bool{})
-	if acc == nil {
-		t.Fatal("expected fallback account, got nil")
+	if !ok {
+		t.Fatal("expected quota error to set a cooldown")
 	}
-	if acc.ID == "a" {
-		t.Fatal("expected expired sticky entry to be ignored, but it was still used")
-	}
-}
-
-func TestGetForSessionFallsBackWhenStickyAccountInCooldown(t *testing.T) {
-	p := newStickyTestPool(
-		config.Account{ID: "a"},
-		config.Account{ID: "b"},
-	)
-	p.RecordStickySuccess("conv-1", "a")
-	p.mu.Lock()
-	p.cooldowns["a"] = time.Now().Add(time.Minute)
-	p.mu.Unlock()
-
-	acc := p.GetForSession("conv-1", "model", map[string]bool{})
-	if acc == nil || acc.ID != "b" {
-		t.Fatalf("expected fallback to account b when sticky account is in cooldown, got %#v", acc)
-	}
-}
-
-func TestGetForSessionIgnoresEmptySessionKey(t *testing.T) {
-	p := newStickyTestPool(config.Account{ID: "a"})
-	acc := p.GetForSession("", "model", map[string]bool{})
-	if acc == nil || acc.ID != "a" {
-		t.Fatalf("expected round robin when sessionKey is empty, got %#v", acc)
-	}
-}
-
-func TestGetForSessionDisabledSwitchFallsBackToRoundRobin(t *testing.T) {
-	cfgFile := filepath.Join(t.TempDir(), "config.json")
-	if err := config.Init(cfgFile); err != nil {
-		t.Fatalf("config.Init: %v", err)
-	}
-	if err := config.UpdateStickySessionRouting(false); err != nil {
-		t.Fatalf("UpdateStickySessionRouting: %v", err)
-	}
-
-	p := newStickyTestPool(
-		config.Account{ID: "a"},
-		config.Account{ID: "b"},
-	)
-	p.RecordStickySuccess("conv-1", "b")
-
-	// RecordStickySuccess itself is a no-op while disabled, so nothing should
-	// have been recorded; GetForSession should degrade to plain round robin.
-	p.mu.RLock()
-	_, tracked := p.stickySessions["conv-1"]
-	p.mu.RUnlock()
-	if tracked {
-		t.Fatal("expected RecordStickySuccess to be a no-op when routing is disabled")
-	}
-
-	acc := p.GetForSession("conv-1", "model", map[string]bool{})
-	if acc == nil {
-		t.Fatal("expected an account from round robin fallback")
-	}
-}
-
-func TestPruneExpiredStickyLockedRemovesOnlyExpiredEntries(t *testing.T) {
-	p := newStickyTestPool()
-	now := time.Now()
-	p.mu.Lock()
-	p.stickySessions["expired"] = stickyEntry{AccountID: "a", ExpiresAt: now.Add(-time.Minute)}
-	p.stickySessions["active"] = stickyEntry{AccountID: "b", ExpiresAt: now.Add(time.Minute)}
-	p.pruneExpiredStickyLocked(now)
-	_, expiredStillPresent := p.stickySessions["expired"]
-	_, activeStillPresent := p.stickySessions["active"]
-	p.mu.Unlock()
-
-	if expiredStillPresent {
-		t.Fatal("expected expired sticky entry to be pruned")
-	}
-	if !activeStillPresent {
-		t.Fatal("expected active sticky entry to remain")
+	// Must be short: within a few seconds of quotaCooldown (60s) — definitely not 1h.
+	if cd.After(time.Now().Add(5 * time.Minute)) {
+		t.Fatalf("expected quota cooldown < 5min, got %v", time.Until(cd))
 	}
 }
 

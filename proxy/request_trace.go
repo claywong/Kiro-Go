@@ -129,14 +129,9 @@ func traceErr(err error) string {
 	return cleanTraceValue(err.Error())
 }
 
-func (h *Handler) pickAccountForModelWithTrace(sessionKey, model string, excluded map[string]bool, attempt int, trace *requestTrace) *config.Account {
+func (h *Handler) pickAccountForModelWithTrace(model string, excluded map[string]bool, attempt int, trace *requestTrace) *config.Account {
 	started := time.Now()
-	var account *config.Account
-	if attempt == 0 {
-		account = h.pool.GetForSession(sessionKey, model, excluded)
-	} else {
-		account = h.pool.GetNextForModelExcluding(model, excluded)
-	}
+	account := h.pool.GetNextForModelExcluding(model, excluded)
 	status := "ok"
 	if account == nil {
 		status = "none"

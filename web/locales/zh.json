@@ -197,6 +197,8 @@
   "detail.generateFailed": "生成失败",
   "detail.weight": "请求权重",
   "detail.weightHint": "0-1=普通, 2+=高优先级",
+  "detail.minInterval": "最小请求间隔（毫秒）",
+  "detail.minIntervalHint": "同一账号两次请求最小间隔。0=不限。敏感账号可设 20000（20 秒）。敏感账号会优先被调度以避免窗口配额浪费。",
   "detail.overage": "超额调用（Overages）",
   "detail.overageHint": "点击开关将调用 AWS Q setUserPreference，立即在 Kiro 后台开/关 Overages",
   "detail.overageStatus": "当前状态",
