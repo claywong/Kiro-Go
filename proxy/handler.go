@@ -897,13 +897,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		messageStarted = true
 	}
 
-	var lastAccountID string
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
 		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1243,12 +1241,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				}
 			} else {
 				h.handleAccountFailure(account, err)
-				h.handleQuotaFallback(account, err, excluded)
 				if !messageStarted {
 					continue
 				}
 			}
-			h.recordFailureWithDetails("claude", model, account.ID, time.Since(reqStart).Milliseconds(), err)
+			h.recordFailureWithDetails("claude", model, account.ID, err)
 			h.sendSSE(w, flusher, "error", map[string]interface{}{
 				"type":  "error",
 				"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1279,7 +1276,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordStickySuccess(payload.ConversationState.ConversationID, account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
@@ -1309,7 +1306,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, lastAccountID, time.Since(reqStart).Milliseconds(), lastErr)
+	h.recordFailureWithDetails("claude", model, "", lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1382,7 +1379,7 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, durationMs int64, err error) {
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 
@@ -1401,12 +1398,11 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, du
 		Status:    "error",
 		Error:     errMsg,
 		ErrorType: errType,
-		Duration:  durationMs,
 	}
 
 	h.appendRequestLog(entry)
-	logger.Warnf("[Request] status=error endpoint=%s model=%s account=%s duration=%dms error_type=%s error=%q",
-		endpoint, model, accountID, durationMs, errType, errMsg)
+	logger.Warnf("[Request] status=error endpoint=%s model=%s account=%s error_type=%s error=%q",
+		endpoint, model, accountID, errType, errMsg)
 }
 
 func (h *Handler) recordTTFTTimeoutRetry(endpoint, model string, account *config.Account, attempt int, err error, trace *requestTrace) {
@@ -1495,13 +1491,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
-	var lastAccountID string
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
 		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -1553,7 +1547,6 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				continue
 			}
 			h.handleAccountFailure(account, err)
-			h.handleQuotaFallback(account, err, excluded)
 			continue
 		}
 
@@ -1576,7 +1569,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordStickySuccess(payload.ConversationState.ConversationID, account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
@@ -1619,7 +1612,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, lastAccountID, time.Since(reqStart).Milliseconds(), lastErr)
+	h.recordFailureWithDetails("claude", model, "", lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1696,13 +1689,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
-	var lastAccountID string
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
 		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2006,12 +1997,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				}
 			} else {
 				h.handleAccountFailure(account, err)
-				h.handleQuotaFallback(account, err, excluded)
 				if !responseStarted {
 					continue
 				}
 			}
-			h.recordFailureWithDetails("openai", model, account.ID, time.Since(reqStart).Milliseconds(), err)
+			h.recordFailureWithDetails("openai", model, account.ID, err)
 			return
 		}
 
@@ -2041,7 +2031,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.RecordStickySuccess(payload.ConversationState.ConversationID, account.ID)
+		h.pool.RecordStickySuccess(sessionKey, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, ttftMs, time.Since(reqStart).Milliseconds(), trace)
 
@@ -2078,7 +2068,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, lastAccountID, time.Since(reqStart).Milliseconds(), lastErr)
+	h.recordFailureWithDetails("openai", model, "", lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2090,13 +2080,11 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
-	var lastAccountID string
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
 		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -2140,7 +2128,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 				continue
 			}
 			h.handleAccountFailure(account, err)
-			h.handleQuotaFallback(account, err, excluded)
 			continue
 		}
 
@@ -2176,7 +2163,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, lastAccountID, time.Since(reqStart).Milliseconds(), lastErr)
+	h.recordFailureWithDetails("openai", model, "", lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -3323,7 +3310,6 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		// 让 pool 感知新的 TTL(下次 sticky 写入用新 TTL)。
 		h.pool.Reload()
 	}
 

@@ -134,13 +134,11 @@ func (h *Handler) handleResponsesNonStream(
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
-	var lastAccountID string
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
 		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -183,7 +181,6 @@ func (h *Handler) handleResponsesNonStream(
 				continue
 			}
 			h.handleAccountFailure(account, err)
-			h.handleQuotaFallback(account, err, excluded)
 			continue
 		}
 
@@ -224,7 +221,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, lastAccountID, time.Since(reqStart).Milliseconds(), lastErr)
+	h.recordFailureWithDetails("responses", model, "", lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -333,13 +330,11 @@ func (h *Handler) handleResponsesStream(
 	reqStart := time.Now()
 	trace := newRequestTrace(reqStart)
 
-	var lastAccountID string
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pickAccountForModelWithTrace(sessionKey, model, excluded, attempt, trace)
 		if account == nil {
 			break
 		}
-		lastAccountID = account.ID
 		if err := h.ensureValidTokenWithTrace(account, trace); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
@@ -502,7 +497,6 @@ func (h *Handler) handleResponsesStream(
 					continue
 				}
 				h.handleAccountFailure(account, err)
-				h.handleQuotaFallback(account, err, excluded)
 				continue
 			}
 			send("response.failed", map[string]interface{}{
@@ -516,7 +510,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
-			h.recordFailureWithDetails("responses", model, account.ID, time.Since(reqStart).Milliseconds(), err)
+			h.recordFailureWithDetails("responses", model, account.ID, err)
 			return
 		}
 
@@ -600,7 +594,7 @@ func (h *Handler) handleResponsesStream(
 		})
 		return
 	}
-	h.recordFailureWithDetails("responses", model, lastAccountID, time.Since(reqStart).Milliseconds(), lastErr)
+	h.recordFailureWithDetails("responses", model, "", lastErr)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

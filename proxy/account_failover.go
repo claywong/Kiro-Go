@@ -88,34 +88,6 @@ func (h *Handler) disableAccountOverage(account *config.Account) {
 	h.pool.Reload()
 }
 
-// handleQuotaFallback 处理 quota (429) 错误的池间降级：
-// 敏感池账号 429 时，一次性把整个敏感池加进本次请求的 excluded，
-// 让下一轮 pickTwoPool 直接落到正常池。
-// 非 quota 错误 / 非敏感账号 / excluded 为 nil 时直接跳过。
-func (h *Handler) handleQuotaFallback(account *config.Account, err error, excluded map[string]bool) {
-	if account == nil || err == nil || excluded == nil {
-		return
-	}
-	if !isQuotaErrorMessage(err.Error()) {
-		return
-	}
-	logger.Warnf("[Quota429] account=%s min_interval_ms=%d error=%q",
-		account.ID, account.MinIntervalMs, err.Error())
-	if account.MinIntervalMs <= 0 {
-		return
-	}
-	ids := h.pool.SensitiveAccountIDs()
-	added := 0
-	for _, id := range ids {
-		if !excluded[id] {
-			excluded[id] = true
-			added++
-		}
-	}
-	logger.Warnf("[QuotaFallback] triggered_by=%s excluded_sensitive=%d total_sensitive=%d — routing next attempt to normal pool",
-		account.ID, added, len(ids))
-}
-
 func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	if account == nil || err == nil {
 		return

@@ -67,11 +67,10 @@ type Account struct {
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
-	// MinIntervalMs is the minimum interval between two requests to this account,
-	// in milliseconds. 0 = no throttle (normal pool). >0 = sensitive pool: the
-	// scheduler will refuse to pick this account within MinIntervalMs of the
-	// previous pick. Sensitive accounts are preferred over normal ones when
-	// available, so their per-window quota isn't wasted.
+	// MinIntervalMs is the minimum interval between two requests to this
+	// account, in milliseconds. 0 = no throttle. >0 = the scheduler skips this
+	// account within MinIntervalMs of its previous pick, protecting accounts
+	// with tight per-window rate limits from tripping upstream 429s.
 	MinIntervalMs int `json:"minIntervalMs,omitempty"`
 
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
@@ -190,15 +189,13 @@ type Config struct {
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
 	// StickySessionRouting controls whether requests belonging to the same
-	// conversation prefer the normal-pool account that last successfully served
-	// it, to maximize prompt-cache hits. Only applies to normal-pool accounts
-	// (MinIntervalMs == 0); sensitive-pool picks never touch sticky state so
-	// their per-window throttle stays authoritative. Defaults to true.
+	// conversation prefer the account that last successfully served it, to
+	// maximize prompt-cache hits. Defaults to true (nil/unset -> true).
 	StickySessionRouting *bool `json:"stickySessionRouting,omitempty"`
 
-	// StickySessionTTLSeconds is how long a conversation stays pinned to its
-	// last successful normal-pool account after last use. 0 or unset means the
-	// built-in default (see GetStickySessionTTL).
+	// StickySessionTTLSeconds controls how long a conversation stays pinned to
+	// its last successful account after last use, in seconds.
+	// 0 or unset uses the built-in default (see GetStickySessionTTL).
 	StickySessionTTLSeconds int `json:"stickySessionTTLSeconds,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
@@ -866,9 +863,9 @@ func UpdateAllowOverUsage(allow bool) error {
 
 // defaultStickySessionTTL is 1 hour: it must cover the longest-lived prompt
 // cache breakpoint TTL (see proxy/cache_tracker.go normalizePromptCacheTTL,
-// which caps at time.Hour for 1h cache_control blocks). If sticky expired
-// before the underlying cache entry, we would reroute to another account
-// and lose the cache benefit the pinning was meant to preserve.
+// which caps at time.Hour for 1h cache_control blocks), otherwise the sticky
+// route could expire and reroute to a different account before the underlying
+// simulated cache entry itself expires, defeating the purpose.
 const defaultStickySessionTTL = time.Hour
 
 // GetStickySessionRouting returns whether sticky session routing is enabled.
