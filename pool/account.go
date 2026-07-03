@@ -23,6 +23,12 @@ const tokenRefreshSkewSeconds int64 = 120
 // 429 只是偶发抖动信号,不需要像以前那样一次 429 就把账号打入 1h 冷宫。
 const quotaCooldown = 60 * time.Second
 
+// stickyEntry 记录某个会话上次成功使用的(正常池)账号,用于提升 prompt cache 命中率。
+type stickyEntry struct {
+	AccountID string
+	ExpiresAt time.Time
+}
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.Mutex
@@ -32,6 +38,12 @@ type AccountPool struct {
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs
 	lastUsedAt    map[string]time.Time       // accountID → 上次被选中的时间(LRU + MinInterval 用)
+
+	// 会话粘性:仅正常池账号参与。敏感池目标是"跑满窗口配额",与 sticky 冲突,
+	// 所以敏感池命中/失败都不动 stickySessions。sticky 只在会话被迫落到正常池时
+	// 生效,提升该账号上模拟 prompt cache 的命中率。
+	stickySessions map[string]stickyEntry // conversationID → 上次成功服务它的正常池账号
+	stickyTTL      time.Duration          // 会话粘性存活时间(config 可覆盖)
 }
 
 var (
@@ -43,10 +55,12 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
-			lastUsedAt:  make(map[string]time.Time),
+			cooldowns:      make(map[string]time.Time),
+			errorCounts:    make(map[string]int),
+			modelLists:     make(map[string]map[string]bool),
+			lastUsedAt:     make(map[string]time.Time),
+			stickySessions: make(map[string]stickyEntry),
+			stickyTTL:      config.GetStickySessionTTL(),
 		}
 		pool.Reload()
 	})
@@ -70,6 +84,25 @@ func (p *AccountPool) Reload() {
 	}
 	p.accounts = filtered
 	p.totalAccounts = len(enabled)
+	// 刷新 sticky TTL(允许运行时改配置),并顺手清理过期条目和指向敏感池/已消失账号的脏映射。
+	p.stickyTTL = config.GetStickySessionTTL()
+	p.pruneStickyLocked(time.Now())
+}
+
+// pruneStickyLocked 清理过期、指向敏感池账号(MinIntervalMs>0)、指向已下线账号
+// 的 sticky 映射。调用方需持有 p.mu。
+func (p *AccountPool) pruneStickyLocked(now time.Time) {
+	normalIDs := make(map[string]bool, len(p.accounts))
+	for i := range p.accounts {
+		if p.accounts[i].MinIntervalMs == 0 {
+			normalIDs[p.accounts[i].ID] = true
+		}
+	}
+	for key, entry := range p.stickySessions {
+		if !entry.ExpiresAt.After(now) || !normalIDs[entry.AccountID] {
+			delete(p.stickySessions, key)
+		}
+	}
 }
 
 // GetNext 获取下一个可用账号
@@ -79,7 +112,20 @@ func (p *AccountPool) GetNext() *config.Account {
 
 // GetNextExcluding 获取下一个可用账号,并跳过指定账号。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
-	return p.pickTwoPool("", excluded)
+	return p.pickTwoPool("", "", excluded)
+}
+
+// GetForSession 会话粘性路由。sessionKey 是对话 ID:
+//   - 敏感池仍按两池 LRU 走(sticky 不介入),这样 MinInterval 窗口配额不被浪费;
+//   - 只有当会话被迫落到正常池时,才优先复用上次成功服务该会话的正常池账号,
+//     以提升该账号上模拟 prompt cache 的命中率。
+//
+// sessionKey == "" 或粘性开关关闭时,行为完全退化为 GetNextForModelExcluding。
+func (p *AccountPool) GetForSession(sessionKey, model string, excluded map[string]bool) *config.Account {
+	if sessionKey == "" || !config.GetStickySessionRouting() {
+		return p.pickTwoPool("", model, excluded)
+	}
+	return p.pickTwoPool(sessionKey, model, excluded)
 }
 
 // SetModelList 缓存账号支持的模型集合(由 handler 在刷新后调用)
@@ -129,12 +175,13 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号,并跳过指定账号。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
-	return p.pickTwoPool(model, excluded)
+	return p.pickTwoPool("", model, excluded)
 }
 
 // pickTwoPool 两池分层 LRU 选账号。敏感池优先(MinInterval>0),空则兜底正常池。
+// sessionKey != "" 时,正常池路径会先尝试复用 sticky 记录里的账号;敏感池不受影响。
 // 选中账号后立即更新 lastUsedAt——在真正发请求前,避免并发窗口撞车。
-func (p *AccountPool) pickTwoPool(model string, excluded map[string]bool) *config.Account {
+func (p *AccountPool) pickTwoPool(sessionKey, model string, excluded map[string]bool) *config.Account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -146,12 +193,60 @@ func (p *AccountPool) pickTwoPool(model string, excluded map[string]bool) *confi
 
 	best := p.pickInPoolLocked(true, model, excluded, now, allowOverUsage)
 	if best == nil {
-		best = p.pickInPoolLocked(false, model, excluded, now, allowOverUsage)
+		// 正常池路径:先尝试 sticky 命中,不中则退回 LRU。
+		if sessionKey != "" {
+			best = p.pickStickyLocked(sessionKey, model, excluded, now, allowOverUsage)
+		}
+		if best == nil {
+			best = p.pickInPoolLocked(false, model, excluded, now, allowOverUsage)
+		}
 	}
 	if best != nil {
 		p.lastUsedAt[best.ID] = now
 	}
 	return best
+}
+
+// pickStickyLocked 尝试用 sessionKey 上次成功服务它的正常池账号。
+// 任一可用性条件不满足(过期/不在池/池分类变了/cooldown/token 快过期/超额/被 excluded/不支持 model)
+// 就返回 nil,由调用方回退到普通 LRU。调用方需持有 p.mu。
+func (p *AccountPool) pickStickyLocked(sessionKey, model string, excluded map[string]bool, now time.Time, allowOverUsage bool) *config.Account {
+	entry, ok := p.stickySessions[sessionKey]
+	if !ok {
+		return nil
+	}
+	if !now.Before(entry.ExpiresAt) {
+		delete(p.stickySessions, sessionKey)
+		return nil
+	}
+	for i := range p.accounts {
+		acc := &p.accounts[i]
+		if acc.ID != entry.AccountID {
+			continue
+		}
+		// sticky 只对正常池账号有效——若上次记录的账号后来被改成敏感池,视为失效。
+		if acc.MinIntervalMs > 0 {
+			return nil
+		}
+		if excluded != nil && excluded[acc.ID] {
+			return nil
+		}
+		if cd, ok := p.cooldowns[acc.ID]; ok && now.Before(cd) {
+			return nil
+		}
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			return nil
+		}
+		if isQuotaBlocked(*acc, allowOverUsage) {
+			return nil
+		}
+		if !p.accountHasModel(acc.ID, model) {
+			return nil
+		}
+		return acc
+	}
+	// 账号已不在池中(被禁用/删除)。
+	return nil
 }
 
 // pickInPoolLocked 在敏感池(sensitive=true)或正常池中做 LRU 选择。
@@ -203,6 +298,56 @@ func (p *AccountPool) pickInPoolLocked(sensitive bool, model string, excluded ma
 		}
 	}
 	return best
+}
+
+// RecordStickySuccess 请求成功后,若使用的是正常池账号,写入/刷新 sticky 映射。
+// 敏感池账号不参与 sticky:它们的调度目标是"跑满窗口配额",与粘性冲突。
+// 只在成功路径调用,一次失败不会永久锁死会话——失败时不写,当次请求 excluded 排除
+// 掉它,下次重试自然换到别的账号。
+func (p *AccountPool) RecordStickySuccess(sessionKey, accountID string) {
+	if sessionKey == "" || accountID == "" || !config.GetStickySessionRouting() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// 仅正常池账号参与 sticky。
+	isNormal := false
+	for i := range p.accounts {
+		if p.accounts[i].ID == accountID {
+			isNormal = p.accounts[i].MinIntervalMs == 0
+			break
+		}
+	}
+	if !isNormal {
+		return
+	}
+	now := time.Now()
+	p.pruneStickyLocked(now)
+	p.stickySessions[sessionKey] = stickyEntry{
+		AccountID: accountID,
+		ExpiresAt: now.Add(p.stickyTTL),
+	}
+}
+
+// StickySessionStats 返回 sticky 表的聚合统计,供 admin 状态接口展示。
+// 不暴露明文 sessionKey → accountID 映射,只给计数信息。
+func (p *AccountPool) StickySessionStats() map[string]interface{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	active := 0
+	perAccount := make(map[string]int)
+	for _, entry := range p.stickySessions {
+		if now.Before(entry.ExpiresAt) {
+			active++
+			perAccount[entry.AccountID]++
+		}
+	}
+	return map[string]interface{}{
+		"activeSessions":    active,
+		"totalTracked":      len(p.stickySessions),
+		"sessionsByAccount": perAccount,
+	}
 }
 
 // SensitiveAccountIDs 返回当前可路由账号里 MinIntervalMs>0 的账号 ID 列表。

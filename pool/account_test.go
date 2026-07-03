@@ -10,10 +10,12 @@ import (
 
 func newTestPool(accounts ...config.Account) *AccountPool {
 	p := &AccountPool{
-		cooldowns:   make(map[string]time.Time),
-		errorCounts: make(map[string]int),
-		modelLists:  make(map[string]map[string]bool),
-		lastUsedAt:  make(map[string]time.Time),
+		cooldowns:      make(map[string]time.Time),
+		errorCounts:    make(map[string]int),
+		modelLists:     make(map[string]map[string]bool),
+		lastUsedAt:     make(map[string]time.Time),
+		stickySessions: make(map[string]stickyEntry),
+		stickyTTL:      time.Hour,
 	}
 	p.accounts = accounts
 	return p
@@ -417,5 +419,226 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 
 	if got := p.GetNext(); got != nil {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sticky session routing (仅正常池)
+// ---------------------------------------------------------------------------
+
+func newStickyTestPool(accounts ...config.Account) *AccountPool {
+	p := newTestPool(accounts...)
+	p.stickyTTL = time.Hour
+	return p
+}
+
+// 会话上次成功用的是正常池账号 b，同一会话再来应仍复用 b（即使 a 也可用）。
+func TestGetForSessionReusesLastNormalAccount(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "b")
+
+	for i := 0; i < 5; i++ {
+		acc := p.GetForSession("conv-1", "", nil)
+		if acc == nil || acc.ID != "b" {
+			t.Fatalf("iter %d: expected sticky b, got %#v", i, acc)
+		}
+	}
+}
+
+// 敏感池账号成功不应该被写进 sticky 表——它们跟粘性冲突。
+func TestRecordStickySuccessSkipsSensitiveAccounts(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "s", MinIntervalMs: 60000},
+		config.Account{ID: "n"},
+	)
+	p.RecordStickySuccess("conv-1", "s")
+
+	p.mu.Lock()
+	_, tracked := p.stickySessions["conv-1"]
+	p.mu.Unlock()
+	if tracked {
+		t.Fatal("expected sensitive account to not be recorded in sticky map")
+	}
+}
+
+// 敏感池账号可用时应优先(两池 LRU)，sticky 里指着正常池账号不干扰这个优先级。
+func TestGetForSessionStillPrefersSensitivePool(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "sensitive", MinIntervalMs: 60000},
+		config.Account{ID: "normal"},
+	)
+	p.RecordStickySuccess("conv-1", "normal")
+
+	acc := p.GetForSession("conv-1", "", nil)
+	if acc == nil || acc.ID != "sensitive" {
+		t.Fatalf("sensitive should still be preferred, got %#v", acc)
+	}
+}
+
+// 敏感池被节流时，落到正常池路径，此时应命中 sticky。
+func TestGetForSessionUsesStickyOnSensitiveThrottle(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "sensitive", MinIntervalMs: 60000},
+		config.Account{ID: "n1"},
+		config.Account{ID: "n2"},
+	)
+	// 先耗掉敏感池。
+	if acc := p.GetForSession("conv-1", "", nil); acc == nil || acc.ID != "sensitive" {
+		t.Fatalf("first pick should be sensitive, got %#v", acc)
+	}
+	// 之前 sticky 指向 n2；节流下应复用 n2 而不是 LRU 顺位 n1。
+	p.RecordStickySuccess("conv-1", "n2")
+	acc := p.GetForSession("conv-1", "", nil)
+	if acc == nil || acc.ID != "n2" {
+		t.Fatalf("expected sticky n2 when sensitive throttled, got %#v", acc)
+	}
+}
+
+// sticky 指向的账号被 excluded 时，回退到正常池 LRU。
+func TestGetForSessionFallsBackWhenStickyAccountExcluded(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "a")
+
+	acc := p.GetForSession("conv-1", "", map[string]bool{"a": true})
+	if acc == nil || acc.ID != "b" {
+		t.Fatalf("expected fallback to b when sticky excluded, got %#v", acc)
+	}
+}
+
+// sticky 指向的账号在 cooldown 时，回退到正常池 LRU。
+func TestGetForSessionFallsBackWhenStickyAccountInCooldown(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "a")
+	p.mu.Lock()
+	p.cooldowns["a"] = time.Now().Add(time.Minute)
+	p.mu.Unlock()
+
+	acc := p.GetForSession("conv-1", "", nil)
+	if acc == nil || acc.ID != "b" {
+		t.Fatalf("expected fallback to b when sticky in cooldown, got %#v", acc)
+	}
+}
+
+// sticky 条目过期后应被 prune，一次 GetForSession 后从表中删除。
+func TestGetForSessionExpiredStickyIsDropped(t *testing.T) {
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.mu.Lock()
+	p.stickySessions["conv-1"] = stickyEntry{
+		AccountID: "a",
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	p.mu.Unlock()
+
+	_ = p.GetForSession("conv-1", "", nil)
+
+	p.mu.Lock()
+	_, present := p.stickySessions["conv-1"]
+	p.mu.Unlock()
+	if present {
+		t.Fatal("expected expired sticky entry to be dropped")
+	}
+}
+
+// sessionKey 为空时应完全退化为 LRU。
+func TestGetForSessionIgnoresEmptySessionKey(t *testing.T) {
+	p := newStickyTestPool(config.Account{ID: "a"})
+	acc := p.GetForSession("", "", nil)
+	if acc == nil || acc.ID != "a" {
+		t.Fatalf("expected round robin when sessionKey empty, got %#v", acc)
+	}
+}
+
+// sticky 开关关掉后，RecordStickySuccess 不落表，GetForSession 也退化为 LRU。
+func TestStickyDisabledSwitch(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateStickySessionRouting(false); err != nil {
+		t.Fatalf("UpdateStickySessionRouting: %v", err)
+	}
+	t.Cleanup(func() { _ = config.UpdateStickySessionRouting(true) })
+
+	p := newStickyTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	p.RecordStickySuccess("conv-1", "b")
+
+	p.mu.Lock()
+	_, tracked := p.stickySessions["conv-1"]
+	p.mu.Unlock()
+	if tracked {
+		t.Fatal("expected no sticky record when switch is off")
+	}
+
+	if acc := p.GetForSession("conv-1", "", nil); acc == nil {
+		t.Fatal("expected LRU fallback account, got nil")
+	}
+}
+
+// Reload 时若 sticky 里的账号变成敏感账号(MinIntervalMs 被后台改大)，条目应被清掉。
+func TestReloadPurgesStickyPointingToSensitive(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "x", Enabled: true}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	p := newStickyTestPool()
+	p.stickyTTL = time.Hour
+	p.Reload()
+	p.RecordStickySuccess("conv-1", "x")
+
+	// 现在把 x 改成敏感账号，再 Reload。
+	if err := config.UpdateAccount("x", config.Account{ID: "x", Enabled: true, MinIntervalMs: 60000}); err != nil {
+		t.Fatalf("UpdateAccount: %v", err)
+	}
+	p.Reload()
+
+	p.mu.Lock()
+	_, present := p.stickySessions["conv-1"]
+	p.mu.Unlock()
+	if present {
+		t.Fatal("expected sticky pointing to now-sensitive account to be pruned on Reload")
+	}
+}
+
+// StickySessionStats 只返回聚合计数，不泄漏 sessionKey。
+func TestStickySessionStatsCountsActiveOnly(t *testing.T) {
+	p := newStickyTestPool()
+	now := time.Now()
+	p.mu.Lock()
+	p.stickySessions["active"] = stickyEntry{AccountID: "a", ExpiresAt: now.Add(time.Minute)}
+	p.stickySessions["expired"] = stickyEntry{AccountID: "b", ExpiresAt: now.Add(-time.Minute)}
+	p.mu.Unlock()
+
+	stats := p.StickySessionStats()
+	if got, want := stats["activeSessions"].(int), 1; got != want {
+		t.Fatalf("activeSessions = %d, want %d", got, want)
+	}
+	perAccount, ok := stats["sessionsByAccount"].(map[string]int)
+	if !ok {
+		t.Fatalf("sessionsByAccount type = %T, want map[string]int", stats["sessionsByAccount"])
+	}
+	if perAccount["a"] != 1 {
+		t.Fatalf("expected account a to have 1 active session, got %d", perAccount["a"])
+	}
+	if _, present := perAccount["b"]; present {
+		t.Fatal("expected expired sticky to be excluded from sessionsByAccount")
 	}
 }
