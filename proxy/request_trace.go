@@ -132,7 +132,7 @@ func traceErr(err error) string {
 // pickAccountForModelWithTrace 选账号。sessionKey 非空且 attempt==0 时走会话粘性路径,
 // 让同一对话尽量落回上次成功服务它的正常池账号(提升 prompt cache 命中);
 // 之后的重试走普通两池 LRU,避免坏账号锁死会话。
-func (h *Handler) pickAccountForModelWithTrace(model, sessionKey string, excluded map[string]bool, attempt int, trace *requestTrace) *config.Account {
+func (h *Handler) pickAccountForModelWithTrace(sessionKey, model string, excluded map[string]bool, attempt int, trace *requestTrace) *config.Account {
 	started := time.Now()
 	var account *config.Account
 	if attempt == 0 && sessionKey != "" {
