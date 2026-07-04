@@ -54,7 +54,13 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // message) and insert a placeholder note so the model knows context was elided.
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 900 * 1024
+//
+// TEST: temporarily raised from 900KB to 1.5MB to probe the real upstream
+// limit. Community reports (jwadow/kiro-gateway#73) found the actual boundary
+// as low as ~615KB in some cases, so raising this may surface upstream 400s
+// ("Improperly formed request.") instead of preventing them. Revert to 900KB
+// (or lower) if that happens.
+const maxPayloadBytes = 1536 * 1024
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
 // fit within maxPayloadBytes.
