@@ -12,9 +12,9 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
-// quotaCooldown 是收到 429 后的账号冷却时长。MinIntervalMs 已经在做主动防御,
-// 429 只是偶发抖动信号,不需要一次 429 就把账号打入 1h 冷宫。
-const quotaCooldown = 60 * time.Second
+// quotaCooldown 是收到 429 后的账号冷却时长。不需要一次 429 就把账号打入 1h 冷宫,
+// 但对没配 MinIntervalMs 的账号也不能太短,避免短冷却后立刻撞回同一个限流账号。
+const quotaCooldown = 5 * time.Minute
 
 // stickyEntry 记录某个会话上次成功使用的账号，用于提升 prompt cache 命中率。
 type stickyEntry struct {
@@ -454,7 +454,7 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 429：短冷却。MinIntervalMs 是主动防线，429 只是偶发抖动信号。
+		// 429：冷却 5 分钟，避免无 MinIntervalMs 防线的账号在窗口内反复撞限流。
 		p.cooldowns[id] = time.Now().Add(quotaCooldown)
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟
