@@ -72,7 +72,7 @@ const (
 	// login code at /oauth/token and refreshes at /refreshToken. Do not unify them.
 	kiroSocialTokenURL = "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token"
 	// kiroSsoLoginTimeout bounds how long the listener waits for the user.
-	kiroSsoLoginTimeout = 10 * time.Minute
+	kiroSsoLoginTimeout = 3 * time.Minute
 )
 
 // allowedExternalIdpIssuerSuffixes restricts which IdP issuer/endpoint hosts the
