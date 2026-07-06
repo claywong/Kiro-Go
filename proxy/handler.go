@@ -172,6 +172,28 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 	return ""
 }
 
+// effortAliases maps client-facing effort values that aren't part of Kiro's
+// own enum to the closest real value. "ultracode" is Claude Code's own
+// trigger word for opting a turn into heavy multi-agent workflow
+// orchestration — unrelated to model reasoning effort — but some clients
+// apparently send it as if it were an effort tier, so we treat it as a
+// request for maximum effort. "max" is present in every schema-supporting
+// model's enum (Opus 4.8/4.7/4.6, Sonnet 4.6), so this alias never fails
+// per-model validation.
+var effortAliases = map[string]string{
+	"ultracode": "max",
+}
+
+// normalizeEffort resolves known client-facing aliases to Kiro's real effort
+// enum before validation/forwarding. Values that aren't aliases pass through
+// unchanged (and are validated against the model's own enum downstream).
+func normalizeEffort(effort string) string {
+	if mapped, ok := effortAliases[strings.ToLower(strings.TrimSpace(effort))]; ok {
+		return mapped
+	}
+	return effort
+}
+
 // validateEffortForModel checks a client-supplied effort value against the
 // resolved model's own advertised enum (from its cached
 // additionalModelRequestFieldsSchema), rather than a hardcoded global list —
@@ -875,6 +897,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
 	modelSchema := h.findModelRequestSchema(actualModel)
+	req.Effort = normalizeEffort(req.Effort)
 	if msg := validateEffortForModel(req.Effort, modelSchema); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
@@ -1700,6 +1723,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	modelSchema := h.findModelRequestSchema(actualModel)
+	req.ReasoningEffort = normalizeEffort(req.ReasoningEffort)
 	if msg := validateEffortForModel(req.ReasoningEffort, modelSchema); msg != "" {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return

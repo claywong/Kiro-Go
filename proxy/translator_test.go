@@ -665,10 +665,22 @@ func TestBuildAdditionalModelRequestFieldsNilWhenSchemaUnsupported(t *testing.T)
 	}
 }
 
-func TestBuildAdditionalModelRequestFieldsMapsEnabledToAdaptive(t *testing.T) {
+// Forwarding "enabled" as a native "adaptive" signal regressed production —
+// the real backend's own adaptive judgment frequently chose not to reason at
+// all, overriding the prompt-injection hack that reliably forces visible
+// reasoning. So an "enabled" (or bare suffix-triggered) thinking request must
+// NOT produce a native thinking field; it relies solely on prompt injection.
+// A prior version of this function left thinking.display empty whenever the
+// client didn't set one explicitly — per Kiro's docs, display only takes
+// effect when type is "adaptive", and an unset display appears to default to
+// hidden, which made real thinking output disappear in production. So an
+// "enabled"/"adaptive"/bare suffix-triggered request must always default
+// display to "summarized" so genuine native reasoning stays visible, unless
+// the client explicitly asked to hide it ("omitted").
+func TestBuildAdditionalModelRequestFieldsDefaultsDisplayToSummarized(t *testing.T) {
 	schema := schemaWithThinkingAndEffort(t)
 
-	got := buildAdditionalModelRequestFields(schema, &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048, Display: "summarized"}, true, "")
+	got := buildAdditionalModelRequestFields(schema, &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048}, true, "")
 	if got == nil || got.Thinking == nil {
 		t.Fatalf("expected a native thinking field, got %+v", got)
 	}
@@ -676,7 +688,21 @@ func TestBuildAdditionalModelRequestFieldsMapsEnabledToAdaptive(t *testing.T) {
 		t.Fatalf("expected type enabled to map to adaptive (Kiro has no enabled/budget_tokens), got %q", got.Thinking.Type)
 	}
 	if got.Thinking.Display != "summarized" {
-		t.Fatalf("expected display to carry through, got %q", got.Thinking.Display)
+		t.Fatalf("expected display to default to summarized when unset, got %q", got.Thinking.Display)
+	}
+
+	got = buildAdditionalModelRequestFields(schema, nil, true, "")
+	if got == nil || got.Thinking == nil || got.Thinking.Display != "summarized" {
+		t.Fatalf("expected bare suffix-triggered thinking to also default display to summarized, got %+v", got)
+	}
+}
+
+func TestBuildAdditionalModelRequestFieldsHonorsExplicitOmittedDisplay(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t)
+
+	got := buildAdditionalModelRequestFields(schema, &ClaudeThinkingConfig{Type: "adaptive", Display: "omitted"}, true, "")
+	if got == nil || got.Thinking == nil || got.Thinking.Display != "omitted" {
+		t.Fatalf("expected an explicit 'omitted' display to be honored, got %+v", got)
 	}
 }
 
@@ -718,11 +744,14 @@ func TestClaudeToKiroSendsNativeFieldsAlongsidePromptInjection(t *testing.T) {
 	if payload.AdditionalModelRequestFields.Thinking.Type != "adaptive" {
 		t.Fatalf("expected native thinking type adaptive, got %q", payload.AdditionalModelRequestFields.Thinking.Type)
 	}
+	if payload.AdditionalModelRequestFields.Thinking.Display != "summarized" {
+		t.Fatalf("expected display to default to summarized so reasoning stays visible, got %q", payload.AdditionalModelRequestFields.Thinking.Display)
+	}
 	if payload.AdditionalModelRequestFields.OutputConfig == nil || payload.AdditionalModelRequestFields.OutputConfig.Effort != "max" {
 		t.Fatalf("expected native effort field to be set to max")
 	}
 
-	// The existing prompt-injection fallback must still fire — this change is additive, not a replacement.
+	// The existing prompt-injection fallback must still fire alongside the native field.
 	found := false
 	for _, hist := range payload.ConversationState.History {
 		if hist.UserInputMessage != nil && strings.Contains(hist.UserInputMessage.Content, ThinkingModePrompt) {
@@ -730,7 +759,7 @@ func TestClaudeToKiroSendsNativeFieldsAlongsidePromptInjection(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("expected ThinkingModePrompt to still be injected into history alongside the native field")
+		t.Fatalf("expected ThinkingModePrompt to still be injected into history")
 	}
 }
 
@@ -765,7 +794,11 @@ func TestOpenAIToKiroForwardsReasoningEffort(t *testing.T) {
 	if payload.AdditionalModelRequestFields.OutputConfig.Effort != "high" {
 		t.Fatalf("expected effort 'high', got %q", payload.AdditionalModelRequestFields.OutputConfig.Effort)
 	}
-	if payload.AdditionalModelRequestFields.Thinking == nil || payload.AdditionalModelRequestFields.Thinking.Type != "adaptive" {
-		t.Fatalf("expected suffix/bool-triggered thinking to synthesize an adaptive default, got %+v", payload.AdditionalModelRequestFields.Thinking)
+	// OpenAI-format requests have no native thinking object; the bare
+	// suffix-triggered bool should still synthesize a native "adaptive" field
+	// with display defaulted to "summarized" so reasoning stays visible.
+	if payload.AdditionalModelRequestFields.Thinking == nil || payload.AdditionalModelRequestFields.Thinking.Type != "adaptive" ||
+		payload.AdditionalModelRequestFields.Thinking.Display != "summarized" {
+		t.Fatalf("expected adaptive thinking with summarized display, got %+v", payload.AdditionalModelRequestFields.Thinking)
 	}
 }

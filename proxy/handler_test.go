@@ -396,6 +396,26 @@ func TestValidateClaudeThinkingConfig(t *testing.T) {
 	}
 }
 
+func TestNormalizeEffortMapsUltracodeToMax(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"ultracode", "max"},
+		{"UltraCode", "max"},
+		{"  ULTRACODE  ", "max"},
+		{"max", "max"},
+		{"high", "high"},
+		{"", ""},
+		{"unknown-tier", "unknown-tier"},
+	}
+	for _, tc := range tests {
+		if got := normalizeEffort(tc.input); got != tc.want {
+			t.Errorf("normalizeEffort(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 func TestValidateEffortForModel(t *testing.T) {
 	schema := schemaWithThinkingAndEffort(t) // enum: low, medium, high, xhigh, max
 

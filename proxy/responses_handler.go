@@ -110,6 +110,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
+	openaiReq.ReasoningEffort = normalizeEffort(openaiReq.ReasoningEffort)
 	if msg := validateEffortForModel(openaiReq.ReasoningEffort, h.findModelRequestSchema(actualModel)); msg != "" {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return

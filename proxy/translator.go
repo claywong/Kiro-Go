@@ -206,10 +206,21 @@ type ClaudeUsage struct {
 // this leaves untouched.
 //
 // reqThinking is the client's Anthropic-shaped thinking config when available
-// (nil for OpenAI-format requests, which have no such object). Kiro's real
-// schema only accepts thinking.type "adaptive"/"disabled" — there is no
-// "enabled" and no budget_tokens equivalent, so an explicit "enabled" request
-// (or a bare suffix-triggered thinking=true) maps to "adaptive".
+// (nil for OpenAI-format requests, which have no such object).
+//
+// Kiro's native thinking.type only supports "adaptive" (the model decides for
+// itself whether/how much to reason) or "disabled" — there is no deterministic
+// "always reason" mode; "enabled" requests are mapped to "adaptive".
+//
+// display only takes effect when type is "adaptive" and controls whether
+// produced reasoning is visible ("summarized") or hidden ("omitted"). An
+// earlier version of this function left display empty whenever the client
+// didn't set one explicitly (the common case), which — per Kiro's own docs —
+// meant thinking.display was never sent at all; in production this made real
+// thinking output disappear almost entirely, most likely because an unset
+// display defaults to hidden rather than shown. So unless the client
+// explicitly asked for "omitted", we now always default display to
+// "summarized" so genuine native reasoning stays visible.
 func buildAdditionalModelRequestFields(schema *ModelRequestFieldsSchema, reqThinking *ClaudeThinkingConfig, thinking bool, effort string) *AdditionalModelRequestFields {
 	if !schema.SupportsThinking() {
 		return nil
@@ -220,9 +231,9 @@ func buildAdditionalModelRequestFields(schema *ModelRequestFieldsSchema, reqThin
 	case reqThinking != nil && strings.EqualFold(reqThinking.Type, "disabled"):
 		fields.Thinking = &KiroNativeThinking{Type: "disabled"}
 	case thinking:
-		display := ""
-		if reqThinking != nil {
-			display = reqThinking.Display
+		display := "summarized"
+		if reqThinking != nil && strings.EqualFold(reqThinking.Display, "omitted") {
+			display = "omitted"
 		}
 		fields.Thinking = &KiroNativeThinking{Type: "adaptive", Display: display}
 	}
