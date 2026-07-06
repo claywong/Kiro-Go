@@ -734,4 +734,38 @@ type ModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	RequestFieldsSchema *ModelRequestFieldsSchema `json:"additionalModelRequestFieldsSchema,omitempty"`
+}
+
+// ModelRequestFieldsSchema captures the subset of Kiro's per-model
+// additionalModelRequestFieldsSchema we act on: whether the model accepts a
+// native "thinking" field at all, and the model-specific "effort" enum/default.
+// Other schema details (e.g. the top-level max_tokens bounds) aren't parsed —
+// their mapping to client-facing options isn't verified yet.
+type ModelRequestFieldsSchema struct {
+	Properties struct {
+		Thinking     *struct{} `json:"thinking"` // non-nil means the model supports native thinking
+		OutputConfig *struct {
+			Properties struct {
+				Effort struct {
+					Enum    []string `json:"enum"`
+					Default string   `json:"default"`
+				} `json:"effort"`
+			} `json:"properties"`
+		} `json:"output_config"`
+	} `json:"properties"`
+}
+
+// SupportsThinking reports whether the model's schema exposes a native thinking field.
+func (s *ModelRequestFieldsSchema) SupportsThinking() bool {
+	return s != nil && s.Properties.Thinking != nil
+}
+
+// EffortOptions returns the model-specific effort enum, or nil if the model
+// doesn't advertise one.
+func (s *ModelRequestFieldsSchema) EffortOptions() []string {
+	if s == nil || s.Properties.OutputConfig == nil {
+		return nil
+	}
+	return s.Properties.OutputConfig.Properties.Effort.Enum
 }

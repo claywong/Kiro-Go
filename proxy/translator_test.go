@@ -1,9 +1,26 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
+
+// mustModelSchema builds a *ModelRequestFieldsSchema from a JSON literal shaped
+// like Kiro's real additionalModelRequestFieldsSchema, for tests that need a
+// model known to support native thinking/effort.
+func mustModelSchema(t *testing.T, jsonStr string) *ModelRequestFieldsSchema {
+	t.Helper()
+	var s ModelRequestFieldsSchema
+	if err := json.Unmarshal([]byte(jsonStr), &s); err != nil {
+		t.Fatalf("invalid schema json: %v", err)
+	}
+	return &s
+}
+
+func schemaWithThinkingAndEffort(t *testing.T) *ModelRequestFieldsSchema {
+	return mustModelSchema(t, `{"properties":{"thinking":{},"output_config":{"properties":{"effort":{"enum":["low","medium","high","xhigh","max"],"default":"high"}}}}}`)
+}
 
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
 	content := []interface{}{
@@ -51,7 +68,7 @@ func TestOpenAIToKiroPreservesStructuredAssistantAndToolContent(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, nil)
 
 	// History starts with a priming pair.
 	if len(payload.ConversationState.History) != 4 {
@@ -121,7 +138,7 @@ func TestOpenAIToKiroAssistantMapContentInHistory(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, nil)
 
 	if len(payload.ConversationState.History) != 2 {
 		t.Fatalf("expected 2 history entries, got %d", len(payload.ConversationState.History))
@@ -156,7 +173,7 @@ func TestOpenAIToKiroAssistantToolCallsDoNotInjectPlaceholder(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, nil)
 
 	// The mid-history assistant turn carried ONLY a tool call (no text) and is
 	// not the active tool turn, so its structured toolUses are cleared. That
@@ -191,8 +208,8 @@ func TestOpenAIConversationIDStableFromAnchor(t *testing.T) {
 	reqA := &OpenAIRequest{Model: "claude-sonnet-4.5", Messages: baseMessages}
 	reqB := &OpenAIRequest{Model: "claude-sonnet-4.5", Messages: append(baseMessages, OpenAIMessage{Role: "assistant", Content: "Next step"})}
 
-	payloadA := OpenAIToKiro(reqA, false)
-	payloadB := OpenAIToKiro(reqB, false)
+	payloadA := OpenAIToKiro(reqA, false, nil)
+	payloadB := OpenAIToKiro(reqB, false, nil)
 
 	if payloadA.ConversationState.ConversationID == "" || payloadB.ConversationState.ConversationID == "" {
 		t.Fatalf("expected non-empty conversation IDs")
@@ -220,8 +237,8 @@ func TestClaudeConversationIDStableFromAnchor(t *testing.T) {
 		},
 	}
 
-	payloadA := ClaudeToKiro(reqA, false)
-	payloadB := ClaudeToKiro(reqB, false)
+	payloadA := ClaudeToKiro(reqA, false, nil)
+	payloadB := ClaudeToKiro(reqB, false, nil)
 
 	if payloadA.ConversationState.ConversationID == "" || payloadB.ConversationState.ConversationID == "" {
 		t.Fatalf("expected non-empty conversation IDs")
@@ -239,8 +256,8 @@ func TestOpenAIConversationIDRandomForSyntheticAnchor(t *testing.T) {
 		},
 	}
 
-	payloadA := OpenAIToKiro(req, false)
-	payloadB := OpenAIToKiro(req, false)
+	payloadA := OpenAIToKiro(req, false, nil)
+	payloadB := OpenAIToKiro(req, false, nil)
 
 	if payloadA.ConversationState.ConversationID == payloadB.ConversationState.ConversationID {
 		t.Fatalf("expected synthetic anchor to generate non-deterministic conversation IDs")
@@ -256,7 +273,7 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 
 	if len(payload.ConversationState.History) != 0 {
 		t.Fatalf("expected leading assistant-only history to be dropped, got %d entries", len(payload.ConversationState.History))
@@ -301,7 +318,7 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, nil)
 	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
 
 	if !strings.Contains(content, toolResultsContinuationPrefix) {
@@ -505,7 +522,7 @@ func TestClaudeToolResultImageAttachedToCurrentMessage(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected tool_result image attached to current message, got %d images", len(cur.Images))
@@ -549,7 +566,7 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
@@ -582,7 +599,7 @@ func TestOpenAIToolResultImageAttachedToCurrentMessage(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, nil)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected tool image attached to current message, got %d", len(cur.Images))
@@ -622,7 +639,7 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 		},
 	}
 
-	payload := OpenAIToKiro(req, false)
+	payload := OpenAIToKiro(req, false, nil)
 
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
@@ -638,5 +655,117 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 0 {
 		t.Fatalf("tool image should not leak into a later user message, got %d on current", len(cur.Images))
+	}
+}
+
+func TestBuildAdditionalModelRequestFieldsNilWhenSchemaUnsupported(t *testing.T) {
+	got := buildAdditionalModelRequestFields(nil, &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048}, true, "max")
+	if got != nil {
+		t.Fatalf("expected nil for a model without a schema, got %+v", got)
+	}
+}
+
+func TestBuildAdditionalModelRequestFieldsMapsEnabledToAdaptive(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t)
+
+	got := buildAdditionalModelRequestFields(schema, &ClaudeThinkingConfig{Type: "enabled", BudgetTokens: 2048, Display: "summarized"}, true, "")
+	if got == nil || got.Thinking == nil {
+		t.Fatalf("expected a native thinking field, got %+v", got)
+	}
+	if got.Thinking.Type != "adaptive" {
+		t.Fatalf("expected type enabled to map to adaptive (Kiro has no enabled/budget_tokens), got %q", got.Thinking.Type)
+	}
+	if got.Thinking.Display != "summarized" {
+		t.Fatalf("expected display to carry through, got %q", got.Thinking.Display)
+	}
+}
+
+func TestBuildAdditionalModelRequestFieldsHonorsExplicitDisabled(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t)
+
+	got := buildAdditionalModelRequestFields(schema, &ClaudeThinkingConfig{Type: "disabled"}, false, "")
+	if got == nil || got.Thinking == nil || got.Thinking.Type != "disabled" {
+		t.Fatalf("expected explicit disabled to carry through, got %+v", got)
+	}
+}
+
+func TestBuildAdditionalModelRequestFieldsForwardsEffort(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t)
+
+	got := buildAdditionalModelRequestFields(schema, nil, false, "Max")
+	if got == nil || got.OutputConfig == nil {
+		t.Fatalf("expected an output_config, got %+v", got)
+	}
+	if got.OutputConfig.Effort != "max" {
+		t.Fatalf("expected effort to be lowercased and forwarded, got %q", got.OutputConfig.Effort)
+	}
+}
+
+func TestClaudeToKiroSendsNativeFieldsAlongsidePromptInjection(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t)
+	req := &ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+		Thinking: &ClaudeThinkingConfig{Type: "adaptive"},
+		Effort:   "max",
+	}
+
+	payload := ClaudeToKiro(req, true, schema)
+
+	if payload.AdditionalModelRequestFields == nil || payload.AdditionalModelRequestFields.Thinking == nil {
+		t.Fatalf("expected native thinking field to be set")
+	}
+	if payload.AdditionalModelRequestFields.Thinking.Type != "adaptive" {
+		t.Fatalf("expected native thinking type adaptive, got %q", payload.AdditionalModelRequestFields.Thinking.Type)
+	}
+	if payload.AdditionalModelRequestFields.OutputConfig == nil || payload.AdditionalModelRequestFields.OutputConfig.Effort != "max" {
+		t.Fatalf("expected native effort field to be set to max")
+	}
+
+	// The existing prompt-injection fallback must still fire — this change is additive, not a replacement.
+	found := false
+	for _, hist := range payload.ConversationState.History {
+		if hist.UserInputMessage != nil && strings.Contains(hist.UserInputMessage.Content, ThinkingModePrompt) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected ThinkingModePrompt to still be injected into history alongside the native field")
+	}
+}
+
+func TestClaudeToKiroOmitsNativeFieldsForUnsupportedModel(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+		Thinking: &ClaudeThinkingConfig{Type: "adaptive"},
+		Effort:   "max",
+	}
+
+	payload := ClaudeToKiro(req, true, nil)
+
+	if payload.AdditionalModelRequestFields != nil {
+		t.Fatalf("expected no native fields for a model without a schema, got %+v", payload.AdditionalModelRequestFields)
+	}
+}
+
+func TestOpenAIToKiroForwardsReasoningEffort(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t)
+	req := &OpenAIRequest{
+		Model:           "claude-opus-4.8",
+		Messages:        []OpenAIMessage{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "high",
+	}
+
+	payload := OpenAIToKiro(req, true, schema)
+
+	if payload.AdditionalModelRequestFields == nil || payload.AdditionalModelRequestFields.OutputConfig == nil {
+		t.Fatalf("expected native effort field to be set")
+	}
+	if payload.AdditionalModelRequestFields.OutputConfig.Effort != "high" {
+		t.Fatalf("expected effort 'high', got %q", payload.AdditionalModelRequestFields.OutputConfig.Effort)
+	}
+	if payload.AdditionalModelRequestFields.Thinking == nil || payload.AdditionalModelRequestFields.Thinking.Type != "adaptive" {
+		t.Fatalf("expected suffix/bool-triggered thinking to synthesize an adaptive default, got %+v", payload.AdditionalModelRequestFields.Thinking)
 	}
 }

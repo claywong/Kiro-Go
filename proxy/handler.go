@@ -172,6 +172,30 @@ func validateClaudeThinkingConfig(thinking *ClaudeThinkingConfig, maxTokens int)
 	return ""
 }
 
+// validateEffortForModel checks a client-supplied effort value against the
+// resolved model's own advertised enum (from its cached
+// additionalModelRequestFieldsSchema), rather than a hardcoded global list —
+// the valid set and default differ per model and change as Kiro updates its
+// model catalog. A nil schema (model unsupported or not yet cached) or an
+// empty effort skips validation entirely, since nothing will be forwarded
+// upstream in that case.
+func validateEffortForModel(effort string, schema *ModelRequestFieldsSchema) string {
+	if effort == "" || schema == nil {
+		return ""
+	}
+	options := schema.EffortOptions()
+	if len(options) == 0 {
+		return ""
+	}
+	normalized := strings.ToLower(strings.TrimSpace(effort))
+	for _, opt := range options {
+		if strings.EqualFold(opt, normalized) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("effort must be one of: %s", strings.Join(options, ", "))
+}
+
 type claudeThinkingResponseOptions struct {
 	Format      string
 	OmitDisplay bool
@@ -466,6 +490,21 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"totalCredits":    h.getCredits(),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
+}
+
+// findModelRequestSchema looks up the cached additionalModelRequestFieldsSchema
+// for a given Kiro model ID. Returns nil if the model isn't cached or doesn't
+// advertise one (e.g. the cache hasn't been refreshed yet, or the model simply
+// doesn't support native thinking/effort) — callers treat nil as "unsupported".
+func (h *Handler) findModelRequestSchema(modelID string) *ModelRequestFieldsSchema {
+	h.modelsCacheMu.RLock()
+	defer h.modelsCacheMu.RUnlock()
+	for i := range h.cachedModels {
+		if h.cachedModels[i].ModelId == modelID {
+			return h.cachedModels[i].RequestFieldsSchema
+		}
+	}
+	return nil
 }
 
 // handleModels 模型列表
@@ -835,13 +874,18 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+	modelSchema := h.findModelRequestSchema(actualModel)
+	if msg := validateEffortForModel(req.Effort, modelSchema); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	// 转换请求
-	kiroPayload := ClaudeToKiro(&req, thinking)
+	kiroPayload := ClaudeToKiro(&req, thinking, modelSchema)
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -1655,9 +1699,14 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	modelSchema := h.findModelRequestSchema(actualModel)
+	if msg := validateEffortForModel(req.ReasoningEffort, modelSchema); msg != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
+		return
+	}
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
-	kiroPayload := OpenAIToKiro(&req, thinking)
+	kiroPayload := OpenAIToKiro(&req, thinking, modelSchema)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
@@ -3399,7 +3448,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		MaxTokens: 5,
 		Stream:    false,
 	}
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq, thinking, h.findModelRequestSchema(actualModel))
 
 	var content string
 	callback := &KiroStreamCallback{

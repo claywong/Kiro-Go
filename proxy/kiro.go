@@ -156,14 +156,36 @@ type KiroPayload struct {
 		} `json:"currentMessage"`
 		History []KiroHistoryMessage `json:"history,omitempty"`
 	} `json:"conversationState"`
-	ProfileArn      string           `json:"profileArn,omitempty"`
-	InferenceConfig *InferenceConfig `json:"inferenceConfig,omitempty"`
+	ProfileArn                   string                        `json:"profileArn,omitempty"`
+	InferenceConfig              *InferenceConfig              `json:"inferenceConfig,omitempty"`
+	AdditionalModelRequestFields *AdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
 
 	// ToolNameMap maps sanitized tool names (sent to Kiro) back to the
 	// original names supplied by the client. Used to restore original names
 	// in tool_use responses so the client can match them to its tool registry.
 	// Not serialized to the Kiro API request body.
 	ToolNameMap map[string]string `json:"-"`
+}
+
+// AdditionalModelRequestFields carries model-specific parameters Kiro passes
+// straight through to the underlying model (Bedrock-style passthrough). Only
+// sent for models whose ModelRequestFieldsSchema advertises support.
+type AdditionalModelRequestFields struct {
+	Thinking     *KiroNativeThinking `json:"thinking,omitempty"`
+	OutputConfig *KiroOutputConfig   `json:"output_config,omitempty"`
+}
+
+// KiroNativeThinking is Kiro's real thinking shape — distinct from
+// ClaudeThinkingConfig (the client-facing Anthropic shape), which additionally
+// allows type "enabled" and a budget_tokens field that Kiro's native schema
+// doesn't recognize at all.
+type KiroNativeThinking struct {
+	Type    string `json:"type,omitempty"`    // "adaptive" or "disabled"
+	Display string `json:"display,omitempty"` // "summarized" or "omitted"
+}
+
+type KiroOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type KiroUserInputMessage struct {

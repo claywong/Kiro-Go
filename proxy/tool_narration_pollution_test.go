@@ -27,7 +27,7 @@ func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 	}
 	msgs = append(msgs, OpenAIMessage{Role: "user", Content: "summarize"})
 
-	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false, nil)
 
 	for i, h := range payload.ConversationState.History {
 		a := h.AssistantResponseMessage
@@ -91,7 +91,7 @@ func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 	}
 	msgs = append(msgs, OpenAIMessage{Role: "user", Content: "final"})
 
-	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false, nil)
 
 	count := 0
 	for _, h := range payload.ConversationState.History {
@@ -125,7 +125,7 @@ func TestDropsDotPollutedAssistantTurns(t *testing.T) {
 	}
 	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "final question"})
 
-	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false, nil)
 
 	for i, h := range payload.ConversationState.History {
 		a := h.AssistantResponseMessage
@@ -159,7 +159,7 @@ func TestScrubsClientReplayedToolCallText(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 
 	for i, h := range payload.ConversationState.History {
 		if a := h.AssistantResponseMessage; a != nil {

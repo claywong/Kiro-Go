@@ -31,7 +31,7 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 		Messages: msgs,
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -81,7 +81,7 @@ func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
 			{Role: "user", Content: "how are you?"},
 		},
 	}
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 	for _, h := range payload.ConversationState.History {
 		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
 			t.Fatalf("small payload should not be truncated")

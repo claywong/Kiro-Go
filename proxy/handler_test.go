@@ -396,6 +396,41 @@ func TestValidateClaudeThinkingConfig(t *testing.T) {
 	}
 }
 
+func TestValidateEffortForModel(t *testing.T) {
+	schema := schemaWithThinkingAndEffort(t) // enum: low, medium, high, xhigh, max
+
+	tests := []struct {
+		name        string
+		effort      string
+		schema      *ModelRequestFieldsSchema
+		expectError bool
+	}{
+		{"empty effort always passes", "", schema, false},
+		{"nil schema always passes (nothing gets forwarded)", "xhigh", nil, false},
+		{"value in model's enum passes", "xhigh", schema, false},
+		{"value matches case-insensitively", "MAX", schema, false},
+		{"value outside model's enum fails", "ultra", schema, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			errMsg := validateEffortForModel(tc.effort, tc.schema)
+			if tc.expectError && errMsg == "" {
+				t.Fatalf("expected validation error")
+			}
+			if !tc.expectError && errMsg != "" {
+				t.Fatalf("expected effort to be valid, got %q", errMsg)
+			}
+		})
+	}
+
+	// A model like claude-sonnet-4.6 whose enum has no "xhigh" must reject it.
+	noXHigh := mustModelSchema(t, `{"properties":{"thinking":{},"output_config":{"properties":{"effort":{"enum":["low","medium","high","max"],"default":"high"}}}}}`)
+	if errMsg := validateEffortForModel("xhigh", noXHigh); errMsg == "" {
+		t.Fatalf("expected xhigh to be rejected for a model whose enum excludes it")
+	}
+}
+
 func TestResolveClaudeThinkingResponseOptions(t *testing.T) {
 	tests := []struct {
 		name       string

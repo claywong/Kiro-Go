@@ -34,7 +34,7 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 
 	// No history entry may carry structured tool calls or tool results.
 	for i, h := range payload.ConversationState.History {
@@ -112,7 +112,7 @@ func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 		},
 	}
 
-	payload := ClaudeToKiro(req, false)
+	payload := ClaudeToKiro(req, false, nil)
 
 	hist := payload.ConversationState.History
 	if len(hist) == 0 {

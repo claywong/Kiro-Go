@@ -102,13 +102,21 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	if req.MaxOutputTokens != nil {
 		openaiReq.MaxTokens = *req.MaxOutputTokens
 	}
+	if req.Reasoning != nil {
+		openaiReq.ReasoningEffort = req.Reasoning.Effort
+	}
 
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
+	if msg := validateEffortForModel(openaiReq.ReasoningEffort, h.findModelRequestSchema(actualModel)); msg != "" {
+		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
+		return
+	}
+
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
-	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	kiroPayload := OpenAIToKiro(openaiReq, thinking, h.findModelRequestSchema(actualModel))
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()

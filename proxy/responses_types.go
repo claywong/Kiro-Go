@@ -3,17 +3,23 @@ package proxy
 import "encoding/json"
 
 type ResponsesRequest struct {
-	Model              string            `json:"model"`
-	Input              json.RawMessage   `json:"input"`
-	Instructions       string            `json:"instructions,omitempty"`
-	Stream             bool              `json:"stream,omitempty"`
-	Tools              []OpenAITool      `json:"tools,omitempty"`
-	ToolChoice         json.RawMessage   `json:"tool_choice,omitempty"`
-	PreviousResponseID string            `json:"previous_response_id,omitempty"`
-	Store              *bool             `json:"store,omitempty"`
-	Temperature        *float64          `json:"temperature,omitempty"`
-	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
-	Metadata           map[string]string `json:"metadata,omitempty"`
+	Model              string                    `json:"model"`
+	Input              json.RawMessage           `json:"input"`
+	Instructions       string                    `json:"instructions,omitempty"`
+	Stream             bool                      `json:"stream,omitempty"`
+	Tools              []OpenAITool              `json:"tools,omitempty"`
+	ToolChoice         json.RawMessage           `json:"tool_choice,omitempty"`
+	PreviousResponseID string                    `json:"previous_response_id,omitempty"`
+	Store              *bool                     `json:"store,omitempty"`
+	Temperature        *float64                  `json:"temperature,omitempty"`
+	MaxOutputTokens    *int                      `json:"max_output_tokens,omitempty"`
+	Metadata           map[string]string         `json:"metadata,omitempty"`
+	Reasoning          *ResponsesReasoningConfig `json:"reasoning,omitempty"`
+}
+
+// ResponsesReasoningConfig mirrors OpenAI Responses API's reasoning.effort shape.
+type ResponsesReasoningConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ResponsesObject struct {

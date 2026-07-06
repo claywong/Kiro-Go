@@ -134,6 +134,7 @@ type ClaudeRequest struct {
 	Stream      bool                  `json:"stream,omitempty"`
 	System      interface{}           `json:"system,omitempty"` // string or []SystemBlock
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
+	Effort      string                `json:"effort,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
 }
@@ -198,11 +199,49 @@ type ClaudeUsage struct {
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
 }
 
+// buildAdditionalModelRequestFields builds Kiro's native additionalModelRequestFields
+// passthrough. Returns nil when the resolved model's schema doesn't advertise
+// support for it — those models rely entirely on the existing prompt-injection
+// fallback (buildClaudeSystemPrompt / OpenAIToKiro's inline injection), which
+// this leaves untouched.
+//
+// reqThinking is the client's Anthropic-shaped thinking config when available
+// (nil for OpenAI-format requests, which have no such object). Kiro's real
+// schema only accepts thinking.type "adaptive"/"disabled" — there is no
+// "enabled" and no budget_tokens equivalent, so an explicit "enabled" request
+// (or a bare suffix-triggered thinking=true) maps to "adaptive".
+func buildAdditionalModelRequestFields(schema *ModelRequestFieldsSchema, reqThinking *ClaudeThinkingConfig, thinking bool, effort string) *AdditionalModelRequestFields {
+	if !schema.SupportsThinking() {
+		return nil
+	}
+
+	var fields AdditionalModelRequestFields
+	switch {
+	case reqThinking != nil && strings.EqualFold(reqThinking.Type, "disabled"):
+		fields.Thinking = &KiroNativeThinking{Type: "disabled"}
+	case thinking:
+		display := ""
+		if reqThinking != nil {
+			display = reqThinking.Display
+		}
+		fields.Thinking = &KiroNativeThinking{Type: "adaptive", Display: display}
+	}
+
+	if effort != "" {
+		fields.OutputConfig = &KiroOutputConfig{Effort: strings.ToLower(strings.TrimSpace(effort))}
+	}
+
+	if fields.Thinking == nil && fields.OutputConfig == nil {
+		return nil
+	}
+	return &fields
+}
+
 // ==================== Claude -> Kiro 转换 ====================
 
 const maxToolDescLen = 10237
 
-func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
+func ClaudeToKiro(req *ClaudeRequest, thinking bool, schema *ModelRequestFieldsSchema) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -312,6 +351,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
+	payload.AdditionalModelRequestFields = buildAdditionalModelRequestFields(schema, req.Thinking, thinking, req.Effort)
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
@@ -983,13 +1023,14 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature float64         `json:"temperature,omitempty"`
-	TopP        float64         `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Model           string          `json:"model"`
+	Messages        []OpenAIMessage `json:"messages"`
+	MaxTokens       int             `json:"max_tokens,omitempty"`
+	Temperature     float64         `json:"temperature,omitempty"`
+	TopP            float64         `json:"top_p,omitempty"`
+	Stream          bool            `json:"stream,omitempty"`
+	Tools           []OpenAITool    `json:"tools,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1088,7 +1129,7 @@ type OpenAIUsage struct {
 
 // ==================== OpenAI -> Kiro 转换 ====================
 
-func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
+func OpenAIToKiro(req *OpenAIRequest, thinking bool, schema *ModelRequestFieldsSchema) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
@@ -1255,6 +1296,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	payload.AdditionalModelRequestFields = buildAdditionalModelRequestFields(schema, nil, thinking, req.ReasoningEffort)
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
