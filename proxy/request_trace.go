@@ -11,7 +11,7 @@ import (
 
 const slowTTFTDebugThresholdMs int64 = 10_000
 
-var ttftRetryTimeout = 40 * time.Second
+var ttftRetryTimeout = 50 * time.Second
 
 type ttftTimeoutError struct {
 	Timeout  time.Duration
