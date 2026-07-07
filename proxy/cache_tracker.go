@@ -155,10 +155,10 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 		}
 	}
 
-	// Cap cacheable tokens at 95% of total input to ensure a realistic
+	// Cap cacheable tokens at 90% of total input to ensure a realistic
 	// uncached portion. The newest content in a request is never fully
 	// served from cache on the current turn.
-	maxCacheable := int(float64(profile.TotalInputTokens) * 0.95)
+	maxCacheable := int(float64(profile.TotalInputTokens) * 0.90)
 	if lastTokens > maxCacheable {
 		lastTokens = maxCacheable
 	}
