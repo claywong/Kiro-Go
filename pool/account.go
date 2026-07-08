@@ -4,6 +4,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"kiro-go/logger"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,8 +13,17 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// TTFT 动态退避（AI-MD：加性退避 + 乘性衰减）常量。账号首字节耗时变慢时自动
+// 拉大最小调用间隔，变快后乘性衰减恢复，无需手工配置。调参改这里即可。
+const (
+	ttftTriggerMs int64 = 15000   // TTFT 超过此值 → 加性退避(每次 +Step)
+	ttftRecoverMs int64 = 10000   // TTFT 低于此值 → 乘性衰减恢复(低于 Trigger 构成迟滞防抖)
+	ttftStepMs    int64 = 60000   // 退避起步值 & 每次增量 & 归零阈值 (1min)
+	ttftMaxMs     int64 = 3600000 // 退避封顶 60min(事实熔断上限,仍每 60min 自然探测一次)
+)
+
 // quotaCooldown 是收到 429 后的账号冷却时长。不需要一次 429 就把账号打入 1h 冷宫,
-// 但对没配 MinIntervalMs 的账号也不能太短,避免短冷却后立刻撞回同一个限流账号。
+// 但也不能太短,避免短冷却后立刻撞回同一个限流账号。
 const quotaCooldown = 5 * time.Minute
 
 // stickyEntry 记录某个会话上次成功使用的账号，用于提升 prompt cache 命中率。
@@ -35,8 +45,9 @@ type AccountPool struct {
 	stickySessions map[string]stickyEntry // conversationID → 上次成功服务它的账号
 	stickyTTL      time.Duration           // 会话粘性存活时间
 
-	lastMu     sync.Mutex           // 保护 lastUsedAt(选号路径持 RLock,需独立锁做写)
-	lastUsedAt map[string]time.Time // accountID → 上次被选中的时间(MinIntervalMs 节流用)
+	lastMu           sync.Mutex           // 保护 lastUsedAt / dynamicIntervals(选号路径持 RLock,需独立锁做写)
+	lastUsedAt       map[string]time.Time // accountID → 上次被选中的时间(TTFT 退避节流用)
+	dynamicIntervals map[string]int64     // accountID → 当前 TTFT 退避间隔(ms)，0/缺失表示未退避
 }
 
 var (
@@ -48,12 +59,13 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:      make(map[string]time.Time),
-			errorCounts:    make(map[string]int),
-			modelLists:     make(map[string]map[string]bool),
-			lastUsedAt:     make(map[string]time.Time),
-			stickySessions: make(map[string]stickyEntry),
-			stickyTTL:      config.GetStickySessionTTL(),
+			cooldowns:        make(map[string]time.Time),
+			errorCounts:      make(map[string]int),
+			modelLists:       make(map[string]map[string]bool),
+			lastUsedAt:       make(map[string]time.Time),
+			dynamicIntervals: make(map[string]int64),
+			stickySessions:   make(map[string]stickyEntry),
+			stickyTTL:        config.GetStickySessionTTL(),
 		}
 		pool.Reload()
 	})
@@ -86,26 +98,72 @@ func (p *AccountPool) Reload() {
 	p.pruneExpiredStickyLocked(time.Now())
 }
 
-// isThrottled 报告账号是否处于 MinIntervalMs 节流窗口内。
-func (p *AccountPool) isThrottled(acc *config.Account, now time.Time) bool {
-	if acc.MinIntervalMs <= 0 {
-		return false
-	}
+// tryReserveDynSlot 原子地"判是否处于 TTFT 退避窗口 + 通过则占位"。
+// 返回 true 表示放行(未退避,或退避但窗口已过并已抢占),false 表示节流中(应跳过)。
+// 把"判定→占位"合并进一次 lastMu 内,消除退避窗口到期瞬间多个并发请求同时命中
+// 同一账号的惊群窗口。仅供选号主循环 / sticky 命中路径调用;兜底路径继续用 markPicked。
+func (p *AccountPool) tryReserveDynSlot(accID string, now time.Time) bool {
 	p.lastMu.Lock()
 	defer p.lastMu.Unlock()
-	gap := time.Duration(acc.MinIntervalMs) * time.Millisecond
-	return now.Sub(p.lastUsedAt[acc.ID]) < gap
+	dyn := p.dynamicIntervals[accID]
+	if dyn <= 0 {
+		return true
+	}
+	if now.Sub(p.lastUsedAt[accID]) < time.Duration(dyn)*time.Millisecond {
+		return false
+	}
+	p.lastUsedAt[accID] = now
+	return true
 }
 
-// markPicked 记录账号被选中的时间。在真正发请求前记录,避免并发窗口撞车。
-// 只有设置了 MinIntervalMs 的账号需要记录。
+// markPicked 记录账号被选中的时间(仅兜底路径使用)。
+// 主循环 / sticky 命中路径已改用 tryReserveDynSlot 一次性完成判定与占位;
+// 兜底忽略退避直接命中,仍需要在此写 lastUsedAt 以防连续兜底反复命中同一账号。
 func (p *AccountPool) markPicked(acc *config.Account, now time.Time) {
-	if acc == nil || acc.MinIntervalMs <= 0 {
+	if acc == nil {
 		return
 	}
 	p.lastMu.Lock()
+	defer p.lastMu.Unlock()
+	if p.dynamicIntervals[acc.ID] <= 0 {
+		return
+	}
 	p.lastUsedAt[acc.ID] = now
-	p.lastMu.Unlock()
+}
+
+// RecordTTFT 用一次成功请求的真实首字节耗时驱动该账号的自适应退避间隔(AIMD)。
+// 慢(> ttftTriggerMs)则乘性退避、快(< ttftRecoverMs)则乘性衰减,中间地带迟滞不动。
+// 只在成功拿到首字节的路径调用(recordSuccessLog)。
+func (p *AccountPool) RecordTTFT(accountID string, ttftMs int64) {
+	// ttftMs 仅在 OnFirstToken 回调赋值,成功但无首字节回调时为 0,拦掉避免误判为极快。
+	if ttftMs <= 0 {
+		return
+	}
+	p.lastMu.Lock()
+	defer p.lastMu.Unlock()
+	cur := p.dynamicIntervals[accountID]
+	switch {
+	case ttftMs > ttftTriggerMs:
+		next := cur + ttftStepMs
+		if next > ttftMaxMs {
+			next = ttftMaxMs
+		}
+		p.dynamicIntervals[accountID] = next
+		if cur == 0 {
+			logger.Warnf("[TTFTThrottle] 进入退避 account=%s ttft=%dms interval=%dms", accountID, ttftMs, next)
+		}
+	case ttftMs < ttftRecoverMs:
+		if cur == 0 {
+			return
+		}
+		next := cur / 2
+		if next < ttftStepMs {
+			delete(p.dynamicIntervals, accountID)
+			logger.Infof("[TTFTThrottle] 恢复正常 account=%s ttft=%dms", accountID, ttftMs)
+		} else {
+			p.dynamicIntervals[accountID] = next
+		}
+	}
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -146,12 +204,6 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		// 跳过 MinIntervalMs 节流窗口内的账号
-		if p.isThrottled(acc, now) {
-			seen[acc.ID] = true
-			continue
-		}
-
 		// 跳过即将过期的 Token
 		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			seen[acc.ID] = true
@@ -164,7 +216,12 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		p.markPicked(acc, now)
+		// TTFT 退避 CAS: 原子完成"判定是否处于退避窗口 + 通过则占位",
+		// 消除退避到期瞬间多个并发请求同时命中同一账号的惊群。
+		if !p.tryReserveDynSlot(acc.ID, now) {
+			seen[acc.ID] = true
+			continue
+		}
 		return acc
 	}
 
@@ -177,9 +234,6 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if p.isThrottled(acc, now) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
@@ -273,10 +327,6 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		if p.isThrottled(acc, now) {
-			seen[acc.ID] = true
-			continue
-		}
 		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 			seen[acc.ID] = true
 			continue
@@ -285,7 +335,11 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		p.markPicked(acc, now)
+		// TTFT 退避 CAS: 消除惊群。见 GetNextExcluding 同名调用点注释。
+		if !p.tryReserveDynSlot(acc.ID, now) {
+			seen[acc.ID] = true
+			continue
+		}
 		return acc
 	}
 
@@ -301,9 +355,6 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if p.isThrottled(acc, now) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
@@ -347,13 +398,15 @@ func (p *AccountPool) GetForSession(sessionKey, model string, excluded map[strin
 			if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 				break
 			}
-			if p.isThrottled(acc, now) {
-				break
-			}
 			if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
 				break
 			}
 			if isQuotaBlocked(*acc, allowOverUsage) {
+				break
+			}
+			// TTFT 退避 CAS: 消除惊群。sticky 命中同一个 session 通常无并发,
+			// 但多个不同 session 命中同一账号时仍可能撞车,统一走 CAS 更稳。
+			if !p.tryReserveDynSlot(acc.ID, now) {
 				break
 			}
 			found := *acc
@@ -364,7 +417,6 @@ func (p *AccountPool) GetForSession(sessionKey, model string, excluded map[strin
 	p.mu.RUnlock()
 
 	if candidate != nil {
-		p.markPicked(candidate, time.Now())
 		return candidate
 	}
 	return p.GetNextForModelExcluding(model, excluded)
@@ -379,15 +431,7 @@ func (p *AccountPool) RecordStickySuccess(sessionKey, accountID string) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// 设置了 MinIntervalMs 的账号不写粘性：粘住一个会被节流的账号只会反复 miss。
-	for i := range p.accounts {
-		if p.accounts[i].ID == accountID {
-			if p.accounts[i].MinIntervalMs > 0 {
-				return
-			}
-			break
-		}
-	}
+	// 退避账号即使写了粘性,GetForSession 命中时 isDynThrottled 会自动回退轮询,无 bug。
 	now := time.Now()
 	p.pruneExpiredStickyLocked(now)
 	p.stickySessions[sessionKey] = stickyEntry{
@@ -454,7 +498,7 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 429：冷却 5 分钟，避免无 MinIntervalMs 防线的账号在窗口内反复撞限流。
+		// 429：冷却 5 分钟，避免账号在窗口内反复撞限流。
 		p.cooldowns[id] = time.Now().Add(quotaCooldown)
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟

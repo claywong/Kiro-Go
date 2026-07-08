@@ -67,12 +67,6 @@ type Account struct {
 	// Priority weight for load balancing (higher = more requests)
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
-	// MinIntervalMs is the minimum interval between two requests to this
-	// account, in milliseconds. 0 = no throttle. >0 = the scheduler skips this
-	// account within MinIntervalMs of its previous pick, protecting accounts
-	// with tight per-window rate limits from tripping upstream 429s.
-	MinIntervalMs int `json:"minIntervalMs,omitempty"`
-
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
 	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
 	// Allowed values: "ENABLED", "DISABLED", "UNKNOWN" (or empty when not yet fetched).

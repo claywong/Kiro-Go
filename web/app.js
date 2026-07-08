@@ -1209,14 +1209,6 @@
       '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
       '</div>' +
 
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.minInterval')) + '</h4>' +
-      '<div class="form-group">' +
-      '<input type="number" id="minIntervalInput" value="' + (a.minIntervalMs || 0) + '" min="0" step="1000" />' +
-      '<small>' + escapeHtml(t('detail.minIntervalHint')) + '</small>' +
-      '</div>' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveMinInterval" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-      '</div>' +
-
       '<div class="detail-section">' +
       '<h4>' + escapeHtml(t('detail.overage')) +
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button>' +
@@ -1321,11 +1313,6 @@
   async function saveWeight(id) {
     const weight = parseInt($('weightInput').value, 10) || 0;
     await putAccount(id, { weight }, t('detail.saved'));
-  }
-  async function saveMinInterval(id) {
-    let ms = parseInt($('minIntervalInput').value, 10);
-    if (isNaN(ms) || ms < 0) ms = 0;
-    await putAccount(id, { minIntervalMs: ms }, t('detail.saved'));
   }
   function renderOverageBadge(a) {
     const status = (a.overageStatus || '').toUpperCase();
@@ -2981,7 +2968,6 @@
       const a = b.dataset.detailAction;
       if (a === 'saveMachineId') saveMachineId(id);
       else if (a === 'saveWeight') saveWeight(id);
-      else if (a === 'saveMinInterval') saveMinInterval(id);
       else if (a === 'toggleOverage') toggleOverageSwitch(id, b);
       else if (a === 'refreshOverage') refreshAccountOverage(id);
       else if (a === 'saveProxyURL') saveProxyURL(id);

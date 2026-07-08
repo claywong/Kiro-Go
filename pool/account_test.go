@@ -168,55 +168,127 @@ func TestIsSuspensionErrorNilError(t *testing.T) {
 
 func newTestPool(accounts ...config.Account) *AccountPool {
 	p := &AccountPool{
-		cooldowns:   make(map[string]time.Time),
-		errorCounts: make(map[string]int),
-		modelLists:  make(map[string]map[string]bool),
-		lastUsedAt:  make(map[string]time.Time),
+		cooldowns:        make(map[string]time.Time),
+		errorCounts:      make(map[string]int),
+		modelLists:       make(map[string]map[string]bool),
+		lastUsedAt:       make(map[string]time.Time),
+		dynamicIntervals: make(map[string]int64),
 	}
 	p.accounts = accounts
 	return p
 }
 
-func TestMinIntervalThrottlesConsecutivePicks(t *testing.T) {
-	p := newTestPool(
-		config.Account{ID: "sensitive", MinIntervalMs: 60000},
-		config.Account{ID: "normal"},
-	)
+func TestRecordTTFTBackoffAndRecovery(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
 
-	picked := map[string]int{}
-	for i := 0; i < 4; i++ {
-		acc := p.GetNext()
-		if acc == nil {
-			t.Fatalf("pick %d: expected an account, got nil", i)
-		}
-		picked[acc.ID]++
+	// 慢样本触发首次退避:cur=0 → step。
+	p.RecordTTFT("a", ttftTriggerMs+1)
+	if got := p.dynamicIntervals["a"]; got != ttftStepMs {
+		t.Fatalf("first slow sample: dyn=%d want %d", got, ttftStepMs)
 	}
-
-	if picked["sensitive"] > 1 {
-		t.Fatalf("sensitive account picked %d times within its throttle window, want at most 1", picked["sensitive"])
+	// 再次慢:加性递增 cur += step。
+	p.RecordTTFT("a", ttftTriggerMs+1)
+	if got := p.dynamicIntervals["a"]; got != ttftStepMs*2 {
+		t.Fatalf("second slow sample: dyn=%d want %d", got, ttftStepMs*2)
 	}
-	if picked["normal"] < 3 {
-		t.Fatalf("normal account picked %d times, want at least 3", picked["normal"])
+	// 中间地带不动。
+	prev := p.dynamicIntervals["a"]
+	p.RecordTTFT("a", (ttftTriggerMs+ttftRecoverMs)/2)
+	if p.dynamicIntervals["a"] != prev {
+		t.Fatalf("middle band changed dyn: got %d want %d", p.dynamicIntervals["a"], prev)
+	}
+	// 快样本:cur/2 直到低于 step 即删除条目。
+	p.RecordTTFT("a", ttftRecoverMs-1)
+	if p.dynamicIntervals["a"] != prev/2 {
+		t.Fatalf("half decay: got %d want %d", p.dynamicIntervals["a"], prev/2)
+	}
+	p.RecordTTFT("a", ttftRecoverMs-1)
+	if _, ok := p.dynamicIntervals["a"]; ok {
+		t.Fatalf("expected condition removed when below step, got %d", p.dynamicIntervals["a"])
 	}
 }
 
-func TestMinIntervalAccountAvailableAfterWindow(t *testing.T) {
-	p := newTestPool(config.Account{ID: "sensitive", MinIntervalMs: 60000})
+func TestRecordTTFTGuardsZeroAndCap(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
 
-	if acc := p.GetNext(); acc == nil || acc.ID != "sensitive" {
-		t.Fatalf("first pick: expected sensitive account, got %#v", acc)
+	// ttftMs<=0 护栏:不能进入退避、也不会误判为极快。
+	p.RecordTTFT("a", 0)
+	p.RecordTTFT("a", -1)
+	if _, ok := p.dynamicIntervals["a"]; ok {
+		t.Fatalf("ttftMs<=0 should not create dyn entry")
 	}
-	if acc := p.GetNext(); acc != nil {
-		t.Fatalf("second pick inside window: expected nil, got %q", acc.ID)
+	// 持续慢应封顶在 MaxMs(加性 +Step 需要 MaxMs/Step 次到顶,冗余多喂几次)。
+	n := int(ttftMaxMs/ttftStepMs) + 5
+	for i := 0; i < n; i++ {
+		p.RecordTTFT("a", ttftTriggerMs+1)
 	}
+	if got := p.dynamicIntervals["a"]; got != ttftMaxMs {
+		t.Fatalf("cap: dyn=%d want %d", got, ttftMaxMs)
+	}
+}
 
-	// 手动把窗口拨到过去，账号应重新可用。
+func TestDynThrottleSkipsInMainLoopButFallbackStillPicks(t *testing.T) {
+	// 回归:上游全局变慢时所有账号同时退避,兜底必须能选出账号(绝不返回 nil)。
+	p := newTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+	)
+	// 把两个账号都塞进 dynamic 退避且窗口未过。
 	p.lastMu.Lock()
-	p.lastUsedAt["sensitive"] = time.Now().Add(-61 * time.Second)
+	now := time.Now()
+	p.dynamicIntervals["a"] = 60000
+	p.dynamicIntervals["b"] = 60000
+	p.lastUsedAt["a"] = now
+	p.lastUsedAt["b"] = now
 	p.lastMu.Unlock()
 
-	if acc := p.GetNext(); acc == nil || acc.ID != "sensitive" {
-		t.Fatalf("pick after window: expected sensitive account, got %#v", acc)
+	acc := p.GetNext()
+	if acc == nil {
+		t.Fatal("fallback must still pick an account even when all are dyn-throttled, got nil")
+	}
+}
+
+func TestTryReserveDynSlotIsAtomic(t *testing.T) {
+	// 回归:退避窗口刚到期时,连续两次(等价于并发两个 goroutine)只有第一次能抢占,
+	// 第二次因为 lastUsedAt 已被第一次原子更新,再看窗口就还未过。
+	p := newTestPool(config.Account{ID: "a"})
+	p.lastMu.Lock()
+	p.dynamicIntervals["a"] = 60000
+	p.lastUsedAt["a"] = time.Now().Add(-61 * time.Second) // 窗口刚到期
+	p.lastMu.Unlock()
+
+	now := time.Now()
+	if !p.tryReserveDynSlot("a", now) {
+		t.Fatal("first try after window: expected true, got false")
+	}
+	if p.tryReserveDynSlot("a", now) {
+		t.Fatal("second try in the same instant: expected false (惊群防护), got true")
+	}
+	// 未退避账号(dyn=0)始终 no-op 放行,不占位。
+	if !p.tryReserveDynSlot("nonexistent", now) {
+		t.Fatal("unthrottled acc: expected true, got false")
+	}
+	if !p.tryReserveDynSlot("nonexistent", now) {
+		t.Fatal("unthrottled acc second call: still expected true, got false")
+	}
+}
+
+func TestDynThrottleReleaseAfterWindow(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+
+	// 手工塞一次退避:窗口未到直接被主循环跳过、兜底放行。
+	p.lastMu.Lock()
+	p.dynamicIntervals["a"] = 60000
+	p.lastUsedAt["a"] = time.Now()
+	p.lastMu.Unlock()
+
+	// 手动把窗口拨到过去,账号应从主循环正常路径被选中。
+	p.lastMu.Lock()
+	p.lastUsedAt["a"] = time.Now().Add(-61 * time.Second)
+	p.lastMu.Unlock()
+
+	if acc := p.GetNext(); acc == nil || acc.ID != "a" {
+		t.Fatalf("pick after window: expected account a, got %#v", acc)
 	}
 }
 

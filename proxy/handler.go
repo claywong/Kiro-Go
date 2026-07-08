@@ -1502,6 +1502,8 @@ func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int
 		logger.Warnf("[RequestDebug] reason=slow_ttft threshold=%dms endpoint=%s model=%s account=%s ttft=%dms duration=%dms trace=%q",
 			slowTTFTDebugThresholdMs, endpoint, model, accountID, ttftMs, durationMs, trace.summary())
 	}
+	// 用真实首字节耗时驱动该账号的 TTFT 自适应退避。
+	h.pool.RecordTTFT(accountID, ttftMs)
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -2460,7 +2462,6 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
-			"minIntervalMs":     a.MinIntervalMs,
 			"overageStatus":     a.OverageStatus,
 			"overageCapability": a.OverageCapability,
 			"overageCap":        a.OverageCap,
@@ -2570,12 +2571,6 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 	if v, ok := updates["weight"].(float64); ok {
 		existing.Weight = int(v)
-	}
-	if v, ok := updates["minIntervalMs"].(float64); ok {
-		if v < 0 {
-			v = 0
-		}
-		existing.MinIntervalMs = int(v)
 	}
 	if v, ok := updates["proxyURL"].(string); ok {
 		existing.ProxyURL = v
@@ -3645,7 +3640,6 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
-		"minIntervalMs":     account.MinIntervalMs,
 		"overageStatus":     account.OverageStatus,
 		"overageCapability": account.OverageCapability,
 		"overageCap":        account.OverageCap,
