@@ -5,6 +5,7 @@ package pool
 import (
 	"kiro-go/config"
 	"kiro-go/logger"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -290,29 +291,60 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-	// 无可用账号，返回冷却时间最短的（排除额度用尽和节流中的，除非允许超额）
-	var best *config.Account
+	// 无可用账号(含 TTFT 退避账号,兜底故意忽略退避),交给 fallbackPick 挑一个顶上。
+	return p.fallbackPick(excluded, allowOverUsage, now, nil)
+}
+
+// fallbackPick 兜底选号：主循环转了一整圈都没选出账号时用(可能全员在 TTFT 退避、
+// 或 429/连续错误冷却)。兜底故意无视 TTFT 退避——上游整体变慢时几乎所有账号会
+// 同时触发退避,若兜底也遵守退避会导致整池返回 nil,代价比"明知偏慢也硬发"大得多。
+// 优先级:
+//  1. 没有 429/连续错误冷却的候选里,选 TTFT EWMA 最小的(退避最轻/从未观测到慢的账号
+//     天然 EWMA 缺失→视为 0,优先命中);
+//  2. 全员都有 429/连续错误冷却时,退化为选冷却最快到期的那个。
+//
+// extraFilter 用于 GetNextForModelExcluding 额外按模型筛选,GetNextExcluding 传 nil。
+func (p *AccountPool) fallbackPick(excluded map[string]bool, allowOverUsage bool, now time.Time, extraFilter func(acc *config.Account) bool) *config.Account {
+	p.lastMu.Lock()
+	ewmaSnapshot := make(map[string]float64, len(p.ttftEwma))
+	for id, v := range p.ttftEwma {
+		ewmaSnapshot[id] = v
+	}
+	p.lastMu.Unlock()
+
+	var cooldownBest *config.Account
 	var earliest time.Time
+	var noCooldownBest *config.Account
+	bestEwma := math.MaxFloat64
 	for i := range p.accounts {
 		acc := &p.accounts[i]
 		if excluded != nil && excluded[acc.ID] {
+			continue
+		}
+		if extraFilter != nil && !extraFilter(acc) {
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
+			if cooldownBest == nil || cooldown.Before(earliest) {
+				cooldownBest = acc
 				earliest = cooldown
 			}
-		} else {
-			p.markPicked(acc, now)
-			return acc
+			continue
+		}
+		if ewma := ewmaSnapshot[acc.ID]; noCooldownBest == nil || ewma < bestEwma {
+			noCooldownBest = acc
+			bestEwma = ewma
 		}
 	}
-	p.markPicked(best, now)
-	return best
+	if noCooldownBest != nil {
+		p.markPicked(noCooldownBest, now)
+		return noCooldownBest
+	}
+	p.markPicked(cooldownBest, now)
+	return cooldownBest
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -408,32 +440,10 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		return acc
 	}
 
-	// fallback：找冷却时间最短且支持该模型的账号（节流中的除外）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			p.markPicked(acc, now)
-			return acc
-		}
-	}
-	p.markPicked(best, now)
-	return best
+	// 无可用账号(含 TTFT 退避账号)，交给 fallbackPick 挑一个顶上，见其注释。
+	return p.fallbackPick(excluded, allowOverUsage, now, func(acc *config.Account) bool {
+		return p.accountHasModel(acc.ID, model)
+	})
 }
 
 // GetForSession 会话粘性路由：优先复用 sessionKey（对话 ID）上次成功服务过它的账号，
