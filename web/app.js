@@ -910,6 +910,36 @@
     }
     return out.join('');
   }
+  function formatMsDuration(ms) {
+    ms = Number(ms) || 0;
+    if (ms <= 0) return '0s';
+    const totalSec = Math.round(ms / 1000);
+    if (totalSec < 60) return totalSec + 's';
+    const totalMin = Math.floor(totalSec / 60);
+    if (totalMin < 60) return totalMin + 'min';
+    const hr = Math.floor(totalMin / 60);
+    const remMin = totalMin % 60;
+    return hr + 'h' + (remMin ? remMin + 'min' : '');
+  }
+  function renderBackoffBadge(a) {
+    const ms = a.ttftBackoffMs || 0;
+    if (ms <= 0) return '';
+    const remaining = a.ttftBackoffRemainingMs || 0;
+    const title = t('accounts.backoffHint', formatMsDuration(ms), formatMsDuration(remaining));
+    return '<span class="badge badge-warning" title="' + escapeAttr(title) + '">' + escapeHtml(t('accounts.backoff', formatMsDuration(ms))) + '</span>';
+  }
+  function renderTTFTEwmaBadge(a) {
+    if (a.ttftEwmaMs == null) return '';
+    return '<span class="badge badge-muted" title="' + escapeAttr(t('accounts.ttftEwmaHint')) + '">' + escapeHtml(t('accounts.ttftEwma', formatMsDuration(a.ttftEwmaMs))) + '</span>';
+  }
+  function renderCooldownBadge(a) {
+    const until = a.cooldownUntil || 0;
+    if (!until) return '';
+    const remainingMs = until * 1000 - Date.now();
+    if (remainingMs <= 0) return '';
+    const title = t('accounts.cooldownHint', new Date(until * 1000).toLocaleString());
+    return '<span class="badge badge-error" title="' + escapeAttr(title) + '">' + escapeHtml(t('accounts.cooldown', formatMsDuration(remainingMs))) + '</span>';
+  }
   function formatTokenExpiry(ts) {
     if (!ts) return '-';
     const diff = ts - Date.now() / 1000;
@@ -947,6 +977,9 @@
       const weight = a.weight || 0;
       const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
       const overageBadge = renderOverageBadge(a);
+      const backoffBadge = renderBackoffBadge(a);
+      const ttftEwmaBadge = renderTTFTEwmaBadge(a);
+      const cooldownBadge = renderCooldownBadge(a);
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
       const idAttr = escapeAttr(a.id);
       const displayEmail = getDisplayEmail(a.email, a.id);
@@ -968,6 +1001,9 @@
         getTrialBadge(a) +
         weightBadge +
         overageBadge +
+        cooldownBadge +
+        backoffBadge +
+        ttftEwmaBadge +
         '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
         getStatusBadge(a) +
         '</div>' +
@@ -1239,6 +1275,10 @@
       detailItem(t('detail.errorCount'), a.errorCount || 0) +
       detailItem(t('detail.totalTokens'), formatNum(a.totalTokens || 0)) +
       detailItem(t('detail.totalCredits'), (a.totalCredits || 0).toFixed(2)) +
+      (a.ttftEwmaMs != null ? detailItem(t('detail.ttftEwma'), formatMsDuration(a.ttftEwmaMs)) : '') +
+      (a.ttftBackoffMs ? detailItem(t('detail.ttftBackoff'), formatMsDuration(a.ttftBackoffMs)) : '') +
+      (a.ttftBackoffMs ? detailItem(t('detail.ttftBackoffRemaining'), formatMsDuration(a.ttftBackoffRemainingMs)) : '') +
+      (a.cooldownUntil ? detailItem(t('detail.cooldownUntil'), new Date(a.cooldownUntil * 1000).toLocaleString()) : '') +
       '</div></div>' +
 
       '<div class="detail-section">' +

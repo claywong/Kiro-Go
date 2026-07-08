@@ -2433,6 +2433,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	accounts := config.GetAccounts()
 	poolAccounts := h.pool.GetAllAccounts()
+	ttftStatuses := h.pool.GetTTFTStatuses()
+	cooldowns := h.pool.GetCooldowns()
 
 	// 合并运行时统计
 	statsMap := make(map[string]config.Account)
@@ -2487,6 +2489,16 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+		}
+		if st, ok := ttftStatuses[a.ID]; ok {
+			result[i]["ttftEwmaMs"] = st.EwmaMs
+			if st.BackoffMs > 0 {
+				result[i]["ttftBackoffMs"] = st.BackoffMs
+				result[i]["ttftBackoffRemainingMs"] = st.BackoffRemainingMs
+			}
+		}
+		if until, ok := cooldowns[a.ID]; ok {
+			result[i]["cooldownUntil"] = until
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -3669,6 +3681,16 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"totalTokens":       stats.TotalTokens,
 		"totalCredits":      stats.TotalCredits,
 		"lastUsed":          stats.LastUsed,
+	}
+	if st, ok := h.pool.GetTTFTStatuses()[id]; ok {
+		result["ttftEwmaMs"] = st.EwmaMs
+		if st.BackoffMs > 0 {
+			result["ttftBackoffMs"] = st.BackoffMs
+			result["ttftBackoffRemainingMs"] = st.BackoffRemainingMs
+		}
+	}
+	if until, ok := h.pool.GetCooldowns()[id]; ok {
+		result["cooldownUntil"] = until
 	}
 
 	json.NewEncoder(w).Encode(result)

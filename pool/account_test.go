@@ -173,6 +173,7 @@ func newTestPool(accounts ...config.Account) *AccountPool {
 		modelLists:       make(map[string]map[string]bool),
 		lastUsedAt:       make(map[string]time.Time),
 		dynamicIntervals: make(map[string]int64),
+		ttftEwma:         make(map[string]float64),
 	}
 	p.accounts = accounts
 	return p
