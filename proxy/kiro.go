@@ -601,12 +601,21 @@ func parseEventStreamWithContextAndTrace(ctx context.Context, body io.Reader, ca
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
+			// 正常情况下流应以 isStop 结束并将 currentToolUse 置空。
+			// 若 EOF 时仍有未完成的 tool use，说明流在工具参数传输中途被截断。
+			if currentToolUse != nil {
+				logger.Warnf("[EventStream] Stream ended (EOF) with pending tool use: name=%s bufferLen=%d; likely truncated tool input",
+					currentToolUse.Name, currentToolUse.InputBuffer.Len())
+			}
 			break
 		}
 		if err != nil {
 			if ctxErr := contextError(ctx); ctxErr != nil {
 				return ctxErr
 			}
+			// 读取 prelude 失败：连接在流中途断开。
+			logger.Warnf("[EventStream] Read prelude failed (connection closed mid-response): %v; endpoint=%s pendingToolUse=%v",
+				err, endpointName, currentToolUse != nil)
 			return err
 		}
 
@@ -625,6 +634,9 @@ func parseEventStreamWithContextAndTrace(ctx context.Context, body io.Reader, ca
 			if ctxErr := contextError(ctx); ctxErr != nil {
 				return ctxErr
 			}
+			// 读取消息体失败：连接在单条事件传输中途断开。
+			logger.Warnf("[EventStream] Read message body failed (connection closed mid-event): %v; endpoint=%s expected=%d pendingToolUse=%v",
+				err, endpointName, remaining, currentToolUse != nil)
 			return err
 		}
 
@@ -954,17 +966,38 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 		state.ToolUseID = "toolu_" + uuid.New().String()
 	}
 	var input map[string]interface{}
+	raw := state.InputBuffer.String()
 	if state.InputBuffer.Len() > 0 {
-		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
+		if err := json.Unmarshal([]byte(raw), &input); err != nil {
+			// tool 参数 JSON 解析失败，通常是上游流被中途截断导致 JSON 残缺。
+			// 记录错误、原始长度与内容片段，便于定位 "参数缺失" 类问题。
+			logger.Warnf("[ToolUse] Failed to parse input JSON for tool %q (id=%s): %v; rawLen=%d rawTail=%q",
+				state.Name, state.ToolUseID, err, len(raw), tailSnippet(raw, 200))
+		}
 	}
 	if input == nil {
 		input = make(map[string]interface{})
+	}
+	// 兜底：最终参数为空却仍回传 tool use，客户端会报 "required parameter missing"。
+	// 覆盖 buffer 从未收到数据（流在参数传输前就断开）等无法被上面 Unmarshal 分支捕获的情况。
+	if len(input) == 0 {
+		logger.Warnf("[ToolUse] Empty input for tool %q (id=%s); rawLen=%d — client will likely report missing required parameters",
+			state.Name, state.ToolUseID, len(raw))
 	}
 	callback.OnToolUse(KiroToolUse{
 		ToolUseID: state.ToolUseID,
 		Name:      state.Name,
 		Input:     input,
 	})
+}
+
+// tailSnippet 返回字符串末尾最多 n 个字符，用于日志中展示残缺 JSON 的尾部，
+// 截断的 JSON 尾部最能反映在哪里断开。
+func tailSnippet(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {
