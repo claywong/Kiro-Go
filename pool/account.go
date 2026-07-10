@@ -16,10 +16,15 @@ const tokenRefreshSkewSeconds int64 = 120
 // TTFT 动态退避（AI-MD：加性退避 + 乘性衰减）常量。账号首字节耗时变慢时自动
 // 拉大最小调用间隔，变快后乘性衰减恢复，无需手工配置。调参改这里即可。
 const (
-	ttftTriggerMs int64 = 15000   // TTFT 超过此值 → 加性退避(每次 +Step)
-	ttftRecoverMs int64 = 10000   // TTFT 低于此值 → 乘性衰减恢复(低于 Trigger 构成迟滞防抖)
+	ttftTriggerMs int64 = 15000   // EWMA 超过此值 → 加性退避(每次 +Step)
+	ttftRecoverMs int64 = 10000   // 当次原始 TTFT 低于此值 → 乘性衰减恢复(低于 Trigger 构成迟滞防抖)
 	ttftStepMs    int64 = 60000   // 退避起步值 & 每次增量 & 归零阈值 (1min)
 	ttftMaxMs     int64 = 3600000 // 退避封顶 60min(事实熔断上限,仍每 60min 自然探测一次)
+
+	// ttftEwmaAlpha 是新样本在 EWMA 里的权重,历史权重为 1-alpha。仅用于加性退避判定,
+	// 目的是防止单次偶发慢请求(如一次大 prompt)在有历史基线时误触发;冷启动(无历史)
+	// 时首个样本直接作为 EWMA 初值,不做稀释,依旧能被单次极慢样本触发。
+	ttftEwmaAlpha float64 = 0.3
 )
 
 // quotaCooldown 是收到 429 后的账号冷却时长。不需要一次 429 就把账号打入 1h 冷宫,
@@ -43,11 +48,12 @@ type AccountPool struct {
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
 
 	stickySessions map[string]stickyEntry // conversationID → 上次成功服务它的账号
-	stickyTTL      time.Duration           // 会话粘性存活时间
+	stickyTTL      time.Duration          // 会话粘性存活时间
 
-	lastMu           sync.Mutex           // 保护 lastUsedAt / dynamicIntervals(选号路径持 RLock,需独立锁做写)
+	lastMu           sync.Mutex           // 保护 lastUsedAt / dynamicIntervals / ttftEwma(选号路径持 RLock,需独立锁做写)
 	lastUsedAt       map[string]time.Time // accountID → 上次被选中的时间(TTFT 退避节流用)
 	dynamicIntervals map[string]int64     // accountID → 当前 TTFT 退避间隔(ms)，0/缺失表示未退避
+	ttftEwma         map[string]float64   // accountID → TTFT 的指数滑动平均(ms)，仅用于加性退避判定，缺失表示尚无样本
 }
 
 var (
@@ -64,6 +70,7 @@ func GetPool() *AccountPool {
 			modelLists:       make(map[string]map[string]bool),
 			lastUsedAt:       make(map[string]time.Time),
 			dynamicIntervals: make(map[string]int64),
+			ttftEwma:         make(map[string]float64),
 			stickySessions:   make(map[string]stickyEntry),
 			stickyTTL:        config.GetStickySessionTTL(),
 		}
@@ -132,7 +139,8 @@ func (p *AccountPool) markPicked(acc *config.Account, now time.Time) {
 }
 
 // RecordTTFT 用一次成功请求的真实首字节耗时驱动该账号的自适应退避间隔(AIMD)。
-// 慢(> ttftTriggerMs)则乘性退避、快(< ttftRecoverMs)则乘性衰减,中间地带迟滞不动。
+// 加性退避看 EWMA(平滑掉单次偶发慢请求的误触发),乘性衰减看当次原始值(避免退避期间
+// 请求变稀疏后 EWMA 迟迟追不上真实好转,把恢复卡死)。中间地带迟滞不动。
 // 只在成功拿到首字节的路径调用(recordSuccessLog)。
 func (p *AccountPool) RecordTTFT(accountID string, ttftMs int64) {
 	// ttftMs 仅在 OnFirstToken 回调赋值,成功但无首字节回调时为 0,拦掉避免误判为极快。
@@ -141,29 +149,86 @@ func (p *AccountPool) RecordTTFT(accountID string, ttftMs int64) {
 	}
 	p.lastMu.Lock()
 	defer p.lastMu.Unlock()
+
+	ewma, seeded := p.ttftEwma[accountID]
+	if !seeded {
+		ewma = float64(ttftMs) // 冷启动无历史可稀释,首个样本即 EWMA 初值
+	} else {
+		ewma = ewma*(1-ttftEwmaAlpha) + float64(ttftMs)*ttftEwmaAlpha
+	}
+	p.ttftEwma[accountID] = ewma
+
 	cur := p.dynamicIntervals[accountID]
 	switch {
-	case ttftMs > ttftTriggerMs:
-		next := cur + ttftStepMs
-		if next > ttftMaxMs {
-			next = ttftMaxMs
-		}
-		p.dynamicIntervals[accountID] = next
-		if cur == 0 {
-			logger.Warnf("[TTFTThrottle] 进入退避 account=%s ttft=%dms interval=%dms", accountID, ttftMs, next)
-		}
 	case ttftMs < ttftRecoverMs:
+		// 恢复用当次原始值,不看 EWMA:退避期间请求间隔被拉长、样本变稀疏,
+		// 若也靠 EWMA 判断会导致均值迟迟降不下来,账号明明已恢复却持续被加深退避。
 		if cur == 0 {
 			return
 		}
 		next := cur / 2
 		if next < ttftStepMs {
 			delete(p.dynamicIntervals, accountID)
-			logger.Infof("[TTFTThrottle] 恢复正常 account=%s ttft=%dms", accountID, ttftMs)
+			logger.Infof("[TTFTThrottle] 恢复正常 account=%s ttft=%dms ewma=%.0fms", accountID, ttftMs, ewma)
 		} else {
 			p.dynamicIntervals[accountID] = next
 		}
+	case ewma > float64(ttftTriggerMs):
+		next := cur + ttftStepMs
+		if next > ttftMaxMs {
+			next = ttftMaxMs
+		}
+		p.dynamicIntervals[accountID] = next
+		if cur == 0 {
+			logger.Warnf("[TTFTThrottle] 进入退避 account=%s ttft=%dms ewma=%.0fms interval=%dms", accountID, ttftMs, ewma, next)
+		}
 	}
+}
+
+// TTFTStatus 是某账号 TTFT 自适应退避状态的只读快照,供 API/前端展示用。
+type TTFTStatus struct {
+	EwmaMs             float64 // 当前 TTFT 指数滑动平均(ms),仅用于加性退避判定
+	BackoffMs          int64   // 当前 AIMD 退避间隔(ms),0 表示未退避
+	BackoffRemainingMs int64   // 距离下一次可被选中还剩多少 ms(窗口已过则为 0,但仍处于退避状态)
+}
+
+// GetCooldowns 返回当前仍处于冷却中的账号快照(accountID → 冷却截止时间的 Unix 秒)。
+// 冷却来源包括 429/连续错误(RecordError)、禁用兜底(DisableAccount)等写入点,
+// 统一供账号列表展示"冷却中"状态用;已过期的条目不返回。
+func (p *AccountPool) GetCooldowns() map[string]int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	result := make(map[string]int64, len(p.cooldowns))
+	for id, until := range p.cooldowns {
+		if now.Before(until) {
+			result[id] = until.Unix()
+		}
+	}
+	return result
+}
+
+// GetTTFTStatuses 返回所有已产生过成功 TTFT 样本的账号快照(accountID → EWMA/退避状态)。
+// 只要 RecordTTFT 记录过至少一次样本就会出现在结果里,不要求正处于退避中;
+// 供账号列表/详情页展示 TTFT 均值与退避状态用。
+func (p *AccountPool) GetTTFTStatuses() map[string]TTFTStatus {
+	p.lastMu.Lock()
+	defer p.lastMu.Unlock()
+	now := time.Now()
+	result := make(map[string]TTFTStatus, len(p.ttftEwma))
+	for id, ewma := range p.ttftEwma {
+		st := TTFTStatus{EwmaMs: ewma}
+		if interval := p.dynamicIntervals[id]; interval > 0 {
+			remaining := interval - now.Sub(p.lastUsedAt[id]).Milliseconds()
+			if remaining < 0 {
+				remaining = 0
+			}
+			st.BackoffMs = interval
+			st.BackoffRemainingMs = remaining
+		}
+		result[id] = st
+	}
+	return result
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
