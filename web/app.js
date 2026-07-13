@@ -888,6 +888,7 @@
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
+    if (normalized === 'api_key' || normalized === 'apikey') return t('auth.apikey');
     return method;
   }
   function getStatusBadge(a) {
@@ -2067,7 +2068,8 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    apikey: 'fa-solid fa-lock'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -2092,6 +2094,7 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'apikey') modalApiKey(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -2119,6 +2122,7 @@
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
+      methodCard('apikey', t('modal.apikeyTitle'), t('modal.apikeyDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
@@ -2249,6 +2253,24 @@
       '<button class="btn btn-primary" id="importCredBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importCredBtn').addEventListener('click', importCredentials);
+  }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apikeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apikeyDesc')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.keyLabel')) + '</label>' +
+      '<input type="password" id="apikeyInput" placeholder="' + escapeAttr(t('apikey.keyPlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nicknameLabel')) + '</label>' +
+      '<input type="text" id="apikeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.authRegionLabel')) + '</label>' +
+      '<input type="text" id="apikeyAuthRegion" placeholder="' + escapeAttr(t('apikey.regionPlaceholder')) + '" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegionLabel')) + '</label>' +
+      '<input type="text" id="apikeyApiRegion" placeholder="' + escapeAttr(t('apikey.regionPlaceholder')) + '" value="us-east-1" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
   }
   function modalCookie(title, body) {
     title.textContent = t('modal.cookieTitle');
@@ -2411,6 +2433,24 @@
       });
     }
     return { items, skipped };
+  }
+  async function importApiKey() {
+    const key = $('apikeyInput').value.trim();
+    if (!key) return toastWarning(t('apikey.keyRequired'));
+    const payload = {
+      authMethod: 'api_key',
+      kiroApiKey: key,
+      nickname: $('apikeyNickname').value.trim() || '',
+      authRegion: $('apikeyAuthRegion').value.trim() || 'us-east-1',
+      apiRegion: $('apikeyApiRegion').value.trim() || 'us-east-1',
+    };
+    const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+    const d = await res.json();
+    if (d.success) {
+      closeModal(); loadAccounts(); loadStats();
+      toastPrimary(t('apikey.success'));
+      if (d.id) autoRefreshNewAccount(d.id);
+    } else toastError(t('common.failed') + ': ' + (d.error || ''));
   }
   async function importFromCookie() {
     const refreshToken = $('cookieRefreshToken').value.trim();
