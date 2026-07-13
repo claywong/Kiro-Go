@@ -374,6 +374,11 @@ func ensureRestProfileArn(account *config.Account) error {
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
 		return nil
 	}
+	if account.IsApiKeyCredential() {
+		// API-key 账号数据面用 bearer 直连，getUsageLimits 无需 profileArn
+		// （与上游 kirogo-api 行为一致，profileArn 为空即发不带该参数的请求）。
+		return nil
+	}
 	profileArn, err := ResolveProfileArn(account)
 	if err != nil {
 		if isProfileArnResolutionSoftError(err) {

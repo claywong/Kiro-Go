@@ -3226,15 +3226,16 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 		// Create API-key account without requiring refresh
 		account := config.Account{
-			ID:         auth.GenerateAccountID(),
-			KiroApiKey: req.KiroApiKey,
-			AuthMethod: "api_key",
-			Region:     req.Region,
-			AuthRegion: req.AuthRegion,
-			ApiRegion:  req.ApiRegion,
-			ExpiresAt:  0,
-			Enabled:    true,
-			MachineId:  config.GenerateMachineId(),
+			ID:          auth.GenerateAccountID(),
+			KiroApiKey:  req.KiroApiKey,
+			AccessToken: req.KiroApiKey, // pool 兼容 & hasToken 展示（与 apiAddAccount 一致）
+			AuthMethod:  "api_key",
+			Region:      req.Region,
+			AuthRegion:  req.AuthRegion,
+			ApiRegion:   req.ApiRegion,
+			ExpiresAt:   0,
+			Enabled:     true,
+			MachineId:   config.GenerateMachineId(),
 		}
 
 		// Best-effort: fetch account info to get email
